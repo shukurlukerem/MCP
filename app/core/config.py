@@ -35,8 +35,16 @@ class Settings(BaseSettings):
     # ── Security ──────────────────────────────────────────────────────────────
     SECRET_KEY: str = "changeme"
     FERNET_KEY: str = ""
-    # Shared secret for server-to-server calls from SABAH.OS (Django).
+    # Shared secret for server-to-server calls between SABAH.OS (Django) and this
+    # service — used both ways (Django → here, and here → Django on sign-in).
     INTERNAL_API_KEY: str = ""
+
+    # ── SABAH.OS (Django) API ─────────────────────────────────────────────────
+    # This service owns Google OAuth but delegates the SABAH.OS session to Django:
+    # after verifying the Google identity it POSTs the claims to Django's
+    # /auth/google/internal/complete/, which mints the one-time login code. Django
+    # stays the identity authority; this service just brokers Google.
+    SABAH_API_BASE_URL: str = "http://localhost:8000"
 
     # ── Google OAuth ──────────────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str = ""

@@ -8,10 +8,11 @@ domain(s) are accepted.
 """
 
 import logging
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlencode
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 from google.oauth2 import id_token
@@ -22,15 +23,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.db import get_db
-from app.core.google_client import (
-    GoogleAuthError,
-    get_credential,
-    revoke_credential,
-    upsert_credential,
-)
+from app.core.google_client import get_credential, revoke_credential
 from app.core.google_scopes import describe_services, scopes_for, services_from_scopes
 from app.core.security import (
-    create_access_token,
     create_oauth_state,
     get_current_user,
     verify_oauth_state,
@@ -67,12 +62,15 @@ def build_authorization_url(
     *,
     sabah_user_id: Optional[str] = None,
     redirect_to: Optional[str] = None,
+    next_path: Optional[str] = None,
 ) -> dict:
     """
     Build the Google consent URL plus a signed state.
 
     ``sabah_user_id`` is carried through the state so the callback can link the
     Google account to the SABAH.OS user without a server-side session.
+    ``next_path`` is the in-app path the SPA should land on after sign-in; it is
+    threaded through the state and handed back on the final redirect.
     """
     if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET:
         raise HTTPException(
@@ -84,6 +82,7 @@ def build_authorization_url(
         {
             "sabah_user_id": str(sabah_user_id) if sabah_user_id else None,
             "redirect_to": redirect_to or settings.FRONTEND_REDIRECT_URL,
+            "next": next_path or "/",
         }
     )
     flow = _build_flow(state=state)
@@ -107,24 +106,71 @@ class AuthURLResponse(BaseModel):
 
 @router.get("/google/url", response_model=AuthURLResponse)
 async def google_auth_url(
+    next: Optional[str] = Query(
+        default=None,
+        description="In-app path the SPA should land on after sign-in",
+    ),
     redirect_to: Optional[str] = Query(
         default=None,
         description="Where to send the browser after the callback completes",
     ),
 ):
     """Return the Google consent URL (for clients that redirect themselves)."""
-    return build_authorization_url(redirect_to=redirect_to)
+    return build_authorization_url(redirect_to=redirect_to, next_path=next)
 
 
 @router.get("/google/login")
-async def google_login(redirect_to: Optional[str] = Query(default=None)):
+async def google_login(
+    next: Optional[str] = Query(default=None),
+    redirect_to: Optional[str] = Query(default=None),
+):
     """Begin the Google OAuth flow by redirecting to the consent screen."""
-    return RedirectResponse(url=build_authorization_url(redirect_to=redirect_to)["authorization_url"])
+    return RedirectResponse(
+        url=build_authorization_url(redirect_to=redirect_to, next_path=next)["authorization_url"]
+    )
 
 
 def _callback_redirect(target: str, params: dict) -> RedirectResponse:
+    # Drop None values so urlencode never emits "code=None".
+    clean = {k: v for k, v in params.items() if v is not None}
     separator = "&" if "?" in target else "?"
-    return RedirectResponse(url=f"{target}{separator}{urlencode(params)}")
+    return RedirectResponse(url=f"{target}{separator}{urlencode(clean)}")
+
+
+async def _complete_via_sabah(claims: dict, tokens: dict, *, next_path: str, link_user_id) -> dict:
+    """
+    Hand the Google-verified identity to SABAH.OS (Django) to resolve the user and
+    mint the one-time login code. Django owns the user model; this service only
+    brokers Google. Returns the redirect params to forward to the SPA.
+    """
+    if not settings.INTERNAL_API_KEY:
+        logger.error("Google callback: INTERNAL_API_KEY unset — cannot reach SABAH.OS")
+        return {"status": "error", "code": "sabah_not_configured", "next": next_path}
+
+    url = f"{settings.SABAH_API_BASE_URL.rstrip('/')}/api/v1/auth/google/internal/complete/"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                url,
+                headers={"X-Internal-Key": settings.INTERNAL_API_KEY},
+                json={
+                    "claims": claims,
+                    "tokens": tokens,
+                    "next": next_path,
+                    "link_user_id": link_user_id,
+                },
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("Google callback: SABAH.OS unreachable: %s", exc)
+        return {"status": "error", "code": "sabah_unreachable", "next": next_path}
+
+    if resp.status_code != 200:
+        logger.warning("Google callback: SABAH.OS returned %s: %s", resp.status_code, resp.text[:200])
+        return {"status": "error", "code": "sabah_error", "next": next_path}
+    try:
+        return resp.json()
+    except ValueError:
+        return {"status": "error", "code": "sabah_bad_response", "next": next_path}
 
 
 @router.get("/google/callback")
@@ -132,18 +178,19 @@ async def google_callback(
     code: Optional[str] = Query(default=None),
     state: str = Query(...),
     error: Optional[str] = Query(default=None),
-    db: AsyncSession = Depends(get_db),
 ):
     """
-    OAuth callback: exchange the code, verify the identity, enforce the corporate
-    domain, store the encrypted credential, and hand a JWT back to the frontend.
+    OAuth callback: exchange the code and verify the Google identity, then delegate
+    to SABAH.OS to resolve the user and mint the session code. This service holds
+    the Google credentials; Django holds the user model.
     """
     state_data = verify_oauth_state(state)
     redirect_to = state_data.get("redirect_to") or settings.FRONTEND_REDIRECT_URL
+    next_path = state_data.get("next") or "/"
 
     if error or not code:
         return _callback_redirect(
-            redirect_to, {"status": "error", "code": error or "missing_code"}
+            redirect_to, {"status": "error", "code": error or "missing_code", "next": next_path}
         )
 
     try:
@@ -151,7 +198,9 @@ async def google_callback(
         flow.fetch_token(code=code)
     except Exception as exc:
         logger.warning("Google token exchange failed: %s", exc)
-        return _callback_redirect(redirect_to, {"status": "error", "code": "token_exchange_failed"})
+        return _callback_redirect(
+            redirect_to, {"status": "error", "code": "token_exchange_failed", "next": next_path}
+        )
 
     credentials = flow.credentials
     try:
@@ -162,54 +211,36 @@ async def google_callback(
         )
     except Exception as exc:
         logger.warning("Google ID token verification failed: %s", exc)
-        return _callback_redirect(redirect_to, {"status": "error", "code": "invalid_id_token"})
-
-    email = (id_info.get("email") or "").lower()
-    if not id_info.get("email_verified", False):
-        return _callback_redirect(redirect_to, {"status": "error", "code": "email_unverified"})
-
-    # Corporate gate — only company Workspace accounts may connect.
-    if not settings.email_domain_allowed(email):
-        logger.info("Rejected non-corporate Google account: %s", email)
         return _callback_redirect(
-            redirect_to,
-            {"status": "error", "code": "domain_not_allowed", "email": email},
+            redirect_to, {"status": "error", "code": "invalid_id_token", "next": next_path}
         )
 
-    granted = list(getattr(credentials, "scopes", None) or google_scopes())
     expiry = credentials.expiry
-    if expiry and expiry.tzinfo is None:
-        expiry = expiry.replace(tzinfo=timezone.utc)
+    expires_in = None
+    if expiry:
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        expires_in = max(0, int((expiry - datetime.now(timezone.utc)).total_seconds()))
 
-    try:
-        cred = await upsert_credential(
-            db,
-            google_sub=id_info["sub"],
-            email=email,
-            access_token=credentials.token,
-            refresh_token=credentials.refresh_token,
-            expiry=expiry,
-            scopes=granted,
-            sabah_user_id=state_data.get("sabah_user_id"),
-        )
-    except GoogleAuthError as exc:
-        logger.warning("Credential store failed for %s: %s", email, exc)
-        return _callback_redirect(redirect_to, {"status": "error", "code": "no_refresh_token"})
+    claims = {
+        "sub": id_info.get("sub"),
+        "email": (id_info.get("email") or "").lower(),
+        "email_verified": bool(id_info.get("email_verified", False)),
+        "name": id_info.get("name", "") or "",
+        "picture": id_info.get("picture", "") or "",
+    }
+    tokens = {
+        "access_token": credentials.token or "",
+        "refresh_token": credentials.refresh_token or "",
+        "expires_in": expires_in,
+        "scope": " ".join(getattr(credentials, "scopes", None) or google_scopes()),
+        "id_token": credentials.id_token,
+    }
 
-    jwt_token = create_access_token(
-        {"sub": cred.user_id, "email": email, "sabah_user_id": cred.sabah_user_id}
+    params = await _complete_via_sabah(
+        claims, tokens, next_path=next_path, link_user_id=state_data.get("sabah_user_id")
     )
-    logger.info("Google account connected: %s (services=%s)", email, cred.services)
-
-    return _callback_redirect(
-        redirect_to,
-        {
-            "status": "success",
-            "token": jwt_token,
-            "email": email,
-            "services": ",".join(cred.services or []),
-        },
-    )
+    return _callback_redirect(redirect_to, params)
 
 
 class ConnectionStatus(BaseModel):
