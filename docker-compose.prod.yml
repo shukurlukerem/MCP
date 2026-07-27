@@ -1,0 +1,101 @@
+# Production stack for the company server.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Differences from the dev stack:
+#   * Postgres and Redis are not published to the host — only the compose network.
+#   * The API listens on 127.0.0.1:8000; nginx (deploy/nginx.conf) terminates TLS.
+#   * A single uvicorn worker per api container, because MCP SSE sessions live in
+#     RAM. To scale, run several api containers behind an ip_hash upstream.
+#   * Log rotation and restart policies so an unattended box stays healthy.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+  api:
+    build:
+      context: .
+      target: runtime
+    restart: always
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0 --port 8000 --workers 1
+      --proxy-headers --forwarded-allow-ips=*
+      --timeout-keep-alive 75
+    environment:
+      RUN_MIGRATIONS: "true"
+    env_file: .env
+    ports:
+      # Bound to loopback — nginx is the only public entrance.
+      - "127.0.0.1:8000:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *logging
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    restart: always
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info --concurrency=4 --max-tasks-per-child=100
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: *logging
+
+volumes:
+  pgdata:
+  redisdata:

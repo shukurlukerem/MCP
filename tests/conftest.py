@@ -5,7 +5,7 @@ from typing import AsyncGenerator
 import pytest
 import pytest_asyncio
 from cryptography.fernet import Fernet
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.db import Base, get_db
@@ -58,10 +58,32 @@ async def client(test_engine, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
     monkeypatch.setattr("app.core.config.settings.FERNET_KEY", TEST_FERNET_KEY)
     monkeypatch.setattr("app.core.security._fernet", None)
 
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    # httpx 0.28 dropped the `app=` shortcut — an explicit ASGI transport is
+    # now the supported way to drive the app in-process.
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
 
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def no_broker(monkeypatch):
+    """
+    Keep API tests off the message broker.
+
+    ``POST /automation/run`` dispatches a Celery task; without this the test
+    would block trying to reach Redis. Dispatch is recorded so tests can assert
+    it happened.
+    """
+    from app.workers.tasks import execute_mcp_task
+
+    dispatched: list[tuple] = []
+    monkeypatch.setattr(
+        execute_mcp_task,
+        "delay",
+        lambda *args, **kwargs: dispatched.append((args, kwargs)),
+    )
+    return dispatched
 
 
 @pytest.fixture

@@ -1,7 +1,7 @@
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,16 +9,20 @@ from app.core.db import get_db
 from app.core.security import get_current_user
 from app.models.automation_run import AutomationRun
 from app.models.mcp_server import MCPServer
-from app.workers.tasks import execute_mcp_task
+from app.workers.tasks import LLM_DISABLED_MESSAGE, execute_mcp_task, llm_available
 
 router = APIRouter(prefix="/automation", tags=["automation"])
 
 
 class RunRequest(BaseModel):
-    mcp_server_id: int
-    tool_name: str
-    input_payload: dict = {}
     instructions: str
+    # Target servers by name (e.g. ["gmail", "drive"]). Empty = every enabled
+    # server, which is the usual corporate case: "search my whole workspace".
+    servers: List[str] = Field(default_factory=list)
+    # Legacy single-server form — still accepted.
+    mcp_server_id: Optional[int] = None
+    tool_name: str = "assistant"
+    input_payload: dict = {}
 
 
 class RunResponse(BaseModel):
@@ -30,10 +34,47 @@ class RunStatusResponse(BaseModel):
     run_id: int
     status: str
     tool_name: str
+    servers: List[str] = []
     output_payload: Optional[dict]
     error_message: Optional[str]
     started_at: Optional[str]
     finished_at: Optional[str]
+
+
+def _to_response(run: AutomationRun) -> RunStatusResponse:
+    return RunStatusResponse(
+        run_id=run.id,
+        status=run.status,
+        tool_name=run.tool_name,
+        servers=run.server_names or [],
+        output_payload=run.output_payload,
+        error_message=run.error_message,
+        started_at=run.started_at.isoformat() if run.started_at else None,
+        finished_at=run.finished_at.isoformat() if run.finished_at else None,
+    )
+
+
+@router.get("/servers")
+async def list_servers(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """MCP servers this deployment can drive."""
+    result = await db.execute(
+        select(MCPServer).where(MCPServer.enabled.is_(True)).order_by(MCPServer.name)
+    )
+    return {
+        "servers": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "provider": s.provider,
+                "service": s.service,
+                "description": s.description,
+            }
+            for s in result.scalars().all()
+        ]
+    }
 
 
 @router.post("/run", status_code=status.HTTP_202_ACCEPTED, response_model=RunResponse)
@@ -45,23 +86,37 @@ async def trigger_run(
     """
     Enqueue an LLM+MCP automation run.
     Returns immediately with run_id; poll /run/{id} for status.
+
+    Requires an LLM to be configured. Without one, reject here rather than
+    persisting a run that the worker could only ever fail.
     """
-    # Validate the MCP server exists and is enabled
-    server = await db.get(MCPServer, request.mcp_server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="MCP server not found")
-    if not server.enabled:
-        raise HTTPException(status_code=400, detail="MCP server is disabled")
+    if not llm_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=LLM_DISABLED_MESSAGE,
+        )
 
-    user_id = current_user["sub"]
+    query = select(MCPServer).where(MCPServer.enabled.is_(True))
+    if request.mcp_server_id is not None:
+        query = query.where(MCPServer.id == request.mcp_server_id)
+    elif request.servers:
+        query = query.where(MCPServer.name.in_(request.servers))
 
-    # Merge instructions into input_payload for the worker
+    servers = (await db.execute(query)).scalars().all()
+    if not servers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No enabled MCP server matches the request",
+        )
+
     payload = dict(request.input_payload)
     payload["instructions"] = request.instructions
 
     run = AutomationRun(
-        user_id=user_id,
-        mcp_server_id=request.mcp_server_id,
+        user_id=current_user["sub"],
+        sabah_user_id=current_user.get("sabah_user_id"),
+        mcp_server_id=servers[0].id if len(servers) == 1 else None,
+        server_names=[s.name for s in servers],
         tool_name=request.tool_name,
         input_payload=payload,
         status="pending",
@@ -71,7 +126,7 @@ async def trigger_run(
     await db.refresh(run)
 
     # Dispatch Celery task — pass only JSON-serializable primitives
-    execute_mcp_task.delay(run.id, user_id)
+    execute_mcp_task.delay(run.id, current_user["sub"])
 
     return RunResponse(run_id=run.id, status="pending")
 
@@ -88,23 +143,14 @@ async def get_run_status(
         raise HTTPException(status_code=404, detail="Run not found")
     if run.user_id != current_user["sub"]:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    return RunStatusResponse(
-        run_id=run.id,
-        status=run.status,
-        tool_name=run.tool_name,
-        output_payload=run.output_payload,
-        error_message=run.error_message,
-        started_at=run.started_at.isoformat() if run.started_at else None,
-        finished_at=run.finished_at.isoformat() if run.finished_at else None,
-    )
+    return _to_response(run)
 
 
 @router.get("/runs", response_model=list[RunStatusResponse])
 async def list_runs(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    limit: int = 20,
+    limit: int = Query(default=20, ge=1, le=100),
 ):
     """List recent automation runs for the current user."""
     result = await db.execute(
@@ -113,16 +159,4 @@ async def list_runs(
         .order_by(AutomationRun.started_at.desc())
         .limit(limit)
     )
-    runs = result.scalars().all()
-    return [
-        RunStatusResponse(
-            run_id=r.id,
-            status=r.status,
-            tool_name=r.tool_name,
-            output_payload=r.output_payload,
-            error_message=r.error_message,
-            started_at=r.started_at.isoformat() if r.started_at else None,
-            finished_at=r.finished_at.isoformat() if r.finished_at else None,
-        )
-        for r in runs
-    ]
+    return [_to_response(r) for r in result.scalars().all()]

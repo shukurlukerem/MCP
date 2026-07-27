@@ -1,64 +1,89 @@
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+"""
+MCP client side: which remote MCP servers exist, and how a user's credential is
+attached to them when the LLM is handed the tool list.
+"""
 
-from authlib.integrations.httpx_client import AsyncOAuth2Client
+import logging
+from typing import List, Optional
+
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
-from app.core.security import decrypt_token, encrypt_token
+from app.core.google_client import access_token_for, refresh_if_needed  # noqa: F401
+from app.core.google_scopes import SERVICES
 from app.models.credential import GoogleCredential
 from app.models.mcp_server import MCPServer
 
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+logger = logging.getLogger(__name__)
 
-# Google Workspace MCP server base URLs
+# Google Workspace remote MCP servers, keyed by service.
 GOOGLE_MCP_URLS = {
-    "gmail": "https://gmail.googleapis.com/mcp",
-    "drive": "https://www.googleapis.com/drive/v3/mcp",
-    "calendar": "https://www.googleapis.com/calendar/v3/mcp",
+    key: service.mcp_url for key, service in SERVICES.items() if service.mcp_url
 }
 
 
-async def refresh_google_token_if_needed(
-    credential: GoogleCredential,
-    session: AsyncSession,
-) -> GoogleCredential:
-    """Refresh Google access token if it expires within 5 minutes."""
-    if credential.token_expiry and credential.token_expiry > datetime.now(timezone.utc) + timedelta(minutes=5):
-        return credential
+def get_google_mcp_server_url(service: str) -> Optional[str]:
+    """Return the MCP server URL for a given Google Workspace service."""
+    return GOOGLE_MCP_URLS.get(service.lower())
 
-    async with AsyncOAuth2Client(
-        client_id=settings.GOOGLE_CLIENT_ID,
-        client_secret=settings.GOOGLE_CLIENT_SECRET,
-    ) as client:
-        token = await client.refresh_token(
-            GOOGLE_TOKEN_URL,
-            refresh_token=decrypt_token(credential.refresh_token),
-        )
 
-    credential.access_token = encrypt_token(token["access_token"])
-    if "expires_at" in token:
-        credential.token_expiry = datetime.fromtimestamp(token["expires_at"], tz=timezone.utc)
-    elif "expires_in" in token:
-        credential.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=token["expires_in"])
+def google_server_seed() -> List[dict]:
+    """Rows the registry is seeded with on first boot."""
+    return [
+        {
+            "name": key,
+            "transport": "http",
+            "url": service.mcp_url,
+            "auth_type": "oauth",
+            "provider": "google",
+            "service": key,
+            "enabled": True,
+            "description": f"{service.label} (Google Workspace MCP server)",
+            "config": {},
+        }
+        for key, service in SERVICES.items()
+        if service.mcp_url
+    ]
 
-    session.add(credential)
-    await session.commit()
-    await session.refresh(credential)
-    return credential
+
+async def ensure_google_servers(session: AsyncSession) -> int:
+    """
+    Idempotently register the Google MCP servers.
+
+    Runs on startup so a fresh deployment is usable without hand-written SQL.
+    Existing rows are left alone — an operator who disables a server or repoints
+    its URL should not have the next restart undo it.
+    """
+    existing = set((await session.execute(select(MCPServer.name))).scalars().all())
+    created = 0
+    for row in google_server_seed():
+        if row["name"] in existing:
+            continue
+        session.add(MCPServer(**row))
+        created += 1
+    if created:
+        await session.commit()
+        logger.info("Registered %d Google MCP servers", created)
+    return created
 
 
 async def build_mcp_tools_config(
     credential: Optional[GoogleCredential],
-    server_records: list[MCPServer],
-) -> list[dict]:
+    server_records: List[MCPServer],
+    session: Optional[AsyncSession] = None,
+) -> List[dict]:
     """
-    Build the `tools` array (type="mcp") passed to the OpenAI Responses API.
-    Decrypts and attaches OAuth access tokens as a Bearer header per server.
+    Build the ``tools`` array (type="mcp") passed to the OpenAI Responses API.
+
+    OAuth servers get a live Bearer token: the token is refreshed first, because
+    a run can start minutes after it was queued and an expired token would fail
+    every tool call in the conversation.
     """
-    tools = []
+    tools: List[dict] = []
+    bearer: Optional[str] = None
+
     for srv in server_records:
-        if not srv.enabled:
+        if not srv.enabled or not srv.url:
             continue
 
         tool: dict = {
@@ -68,15 +93,16 @@ async def build_mcp_tools_config(
             "require_approval": "never",
         }
 
-        if srv.auth_type == "oauth" and credential:
-            token = decrypt_token(credential.access_token)
-            tool["headers"] = {"Authorization": f"Bearer {token}"}
+        if srv.auth_type == "oauth":
+            if not credential or session is None:
+                logger.warning(
+                    "Skipping MCP server %s — no credential available for OAuth", srv.name
+                )
+                continue
+            if bearer is None:
+                bearer = await access_token_for(credential, session)
+            tool["headers"] = {"Authorization": f"Bearer {bearer}"}
 
         tools.append(tool)
 
     return tools
-
-
-def get_google_mcp_server_url(service: str) -> Optional[str]:
-    """Return the MCP server URL for a given Google Workspace service."""
-    return GOOGLE_MCP_URLS.get(service.lower())

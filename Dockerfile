@@ -18,14 +18,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
 COPY --from=builder /install /usr/local
 
 WORKDIR /app
 COPY app/ ./app/
 COPY alembic/ ./alembic/
 COPY alembic.ini .
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Drop root
 USER nobody
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 # CMD is intentionally omitted — overridden per service in docker-compose.yml
