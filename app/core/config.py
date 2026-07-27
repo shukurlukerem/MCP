@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # /auth/google/internal/complete/, which mints the one-time login code. Django
     # stays the identity authority; this service just brokers Google.
     SABAH_API_BASE_URL: str = "http://localhost:8000"
+    # Timeout (seconds) for the delegated sign-in POST to Django. It must cover a
+    # nested round-trip: this call → Django /internal/complete/ → Django pushes the
+    # credential back to /internal/google/credentials here → Django responds. 15s
+    # was too tight on a cold Django and surfaced as a false "SABAH.OS unreachable".
+    SABAH_API_TIMEOUT: float = 30.0
 
     # ── Google OAuth ──────────────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str = ""

@@ -170,7 +170,7 @@ async def _complete_via_sabah(claims: dict, tokens: dict, *, next_path: str, lin
 
     url = f"{settings.SABAH_API_BASE_URL.rstrip('/')}/api/v1/auth/google/internal/complete/"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=settings.SABAH_API_TIMEOUT) as client:
             resp = await client.post(
                 url,
                 headers={"X-Internal-Key": settings.INTERNAL_API_KEY},
@@ -182,7 +182,18 @@ async def _complete_via_sabah(claims: dict, tokens: dict, *, next_path: str, lin
                 },
             )
     except httpx.HTTPError as exc:
-        logger.warning("Google callback: SABAH.OS unreachable: %s", exc)
+        # str(exc) is empty for timeouts, which reads as a bare "unreachable".
+        # Log the exception TYPE + repr + target so the real cause is unambiguous:
+        # ConnectError/ConnectTimeout = Django not listening / bad host; ReadTimeout
+        # = Django reachable but slower than SABAH_API_TIMEOUT. The X-Internal-Key
+        # header is never logged.
+        logger.warning(
+            "Google callback: SABAH.OS request failed [%s]: %r (url=%s, timeout=%ss)",
+            type(exc).__name__,
+            exc,
+            url,
+            settings.SABAH_API_TIMEOUT,
+        )
         return {"status": "error", "code": "sabah_unreachable", "next": next_path}
 
     if resp.status_code != 200:
