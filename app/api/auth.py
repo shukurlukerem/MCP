@@ -8,9 +8,20 @@ domain(s) are accepted.
 """
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlencode
+
+# Google routinely returns the granted scopes in a different order (and adds
+# `openid`/`https://www.googleapis.com/auth/userinfo.*` when `include_granted_scopes`
+# is on). By default oauthlib treats any such difference as an error and raises
+# `Warning("Scope has changed from ... to ...")` from inside fetch_token, which
+# surfaces here as a generic "token_exchange_failed". Relaxing the check lets the
+# exchange succeed; we still record whatever scopes Google actually granted.
+# Must be set before oauthlib runs the token exchange (read from os.environ at
+# fetch time — pydantic settings/.env do NOT populate os.environ, so set it here).
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -18,6 +29,7 @@ from fastapi.responses import RedirectResponse
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from google_auth_oauthlib.flow import Flow
+from oauthlib.oauth2 import OAuth2Error
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +46,15 @@ from app.core.security import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _mask(value: Optional[str]) -> str:
+    """Redact a credential for logging — keep only enough to identify it."""
+    if not value:
+        return "<unset>"
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}…{value[-4:]}"
 
 
 def google_scopes() -> list:
@@ -196,8 +217,33 @@ async def google_callback(
     try:
         flow = _build_flow(state=state)
         flow.fetch_token(code=code)
+    except OAuth2Error as exc:
+        # oauthlib parsed Google's error body — this is the precise reason
+        # (invalid_grant, redirect_uri_mismatch, invalid_client, …). None of
+        # error/description contains a secret or the authorization code.
+        logger.warning(
+            "Google token exchange failed: error=%s description=%s "
+            "(redirect_uri=%s, client_id=%s)",
+            getattr(exc, "error", "unknown"),
+            getattr(exc, "description", str(exc)),
+            settings.GOOGLE_REDIRECT_URI,
+            _mask(settings.GOOGLE_CLIENT_ID),
+        )
+        return _callback_redirect(
+            redirect_to, {"status": "error", "code": "token_exchange_failed", "next": next_path}
+        )
     except Exception as exc:
-        logger.warning("Google token exchange failed: %s", exc)
+        # Anything oauthlib did not classify — e.g. a "Scope has changed" Warning
+        # (handled by OAUTHLIB_RELAX_TOKEN_SCOPE above) or a network error. Log the
+        # type + message so the real cause is visible; never log code/secrets.
+        logger.warning(
+            "Google token exchange failed (unexpected %s): %s "
+            "(redirect_uri=%s, client_id=%s)",
+            type(exc).__name__,
+            exc,
+            settings.GOOGLE_REDIRECT_URI,
+            _mask(settings.GOOGLE_CLIENT_ID),
+        )
         return _callback_redirect(
             redirect_to, {"status": "error", "code": "token_exchange_failed", "next": next_path}
         )
