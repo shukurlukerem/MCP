@@ -18,6 +18,7 @@ from app.core.google_scopes import (
     services_from_scopes,
 )
 from app.mcp.client import build_mcp_tools_config, ensure_google_servers, google_server_seed
+from app.models.automation_run import AutomationRun
 from app.models.credential import GoogleCredential
 from app.models.mcp_server import MCPServer
 from app.services import google_data
@@ -348,3 +349,112 @@ class TestResourceDispatch:
 
         with pytest.raises(GoogleAuthError, match="document_id"):
             await google_data.fetch("docs.document", None, db_session, {})
+
+
+# ── Queueing an automation run ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestInternalAutomationRun:
+    """
+    ``POST /internal/automation/run`` is what the SABAH.OS Integrations page hits.
+    Every refusal here must arrive as a status Django can forward verbatim —
+    anything else reaches the browser as an unexplained 502.
+    """
+
+    INTERNAL_KEY = "correct-key"
+
+    async def _seed(self, client, db_session, monkeypatch, sabah_user_id: str):
+        monkeypatch.setattr("app.core.config.settings.INTERNAL_API_KEY", self.INTERNAL_KEY)
+        monkeypatch.setattr("app.core.config.settings.ALLOWED_EMAIL_DOMAINS", [])
+        await client.post(
+            "/internal/google/credentials",
+            headers={"X-Internal-Key": self.INTERNAL_KEY},
+            json={
+                "sabah_user_id": sabah_user_id,
+                "google_sub": f"sub-{sabah_user_id}",
+                "email": f"user{sabah_user_id}@sabahhub.com",
+                "access_token": "ya29.token",
+                "refresh_token": "1//refresh",
+                "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+            },
+        )
+        await ensure_google_servers(db_session)
+
+    def _post(self, client, sabah_user_id: str):
+        return client.post(
+            "/internal/automation/run",
+            headers={"X-Internal-Key": self.INTERNAL_KEY},
+            json={"sabah_user_id": sabah_user_id, "instructions": "summarise my inbox"},
+        )
+
+    async def test_run_is_queued_when_everything_is_configured(
+        self, client, db_session, monkeypatch, no_broker
+    ):
+        await self._seed(client, db_session, monkeypatch, "70")
+        monkeypatch.setattr("app.workers.tasks.llm_available", lambda: True)
+
+        response = await self._post(client, "70")
+
+        assert response.status_code == 202
+        assert response.json()["status"] == "pending"
+        assert len(no_broker) == 1
+
+    async def test_disabled_llm_is_refused_before_a_run_is_persisted(
+        self, client, db_session, monkeypatch, no_broker
+    ):
+        """
+        The user-facing route already gates on this. Without the same gate here a
+        run is accepted with 202 and then fails in the worker, so the page polls a
+        run that was never going to succeed.
+        """
+        await self._seed(client, db_session, monkeypatch, "71")
+        monkeypatch.setattr("app.workers.tasks.llm_available", lambda: False)
+
+        response = await self._post(client, "71")
+
+        assert response.status_code == 503
+        assert "LLM automation is disabled" in response.json()["detail"]
+        assert no_broker == []
+        rows = (
+            await db_session.execute(
+                select(AutomationRun).where(AutomationRun.sabah_user_id == "71")
+            )
+        ).scalars().all()
+        assert rows == []
+
+    async def test_an_unreachable_broker_fails_the_run_instead_of_hanging(
+        self, client, db_session, monkeypatch
+    ):
+        await self._seed(client, db_session, monkeypatch, "72")
+        monkeypatch.setattr("app.workers.tasks.llm_available", lambda: True)
+
+        def broker_down(*_args, **_kwargs):
+            raise OSError("Connection refused")
+
+        from app.workers.tasks import execute_mcp_task
+
+        monkeypatch.setattr(execute_mcp_task, "delay", broker_down)
+
+        response = await self._post(client, "72")
+
+        assert response.status_code == 503
+        assert "queue is unavailable" in response.json()["detail"]
+        # The row was already committed — it must not be left polling as "pending".
+        run = (
+            await db_session.execute(
+                select(AutomationRun).where(AutomationRun.sabah_user_id == "72")
+            )
+        ).scalars().one()
+        assert run.status == "error"
+        assert "Could not queue" in run.error_message
+
+    async def test_a_user_without_a_google_account_is_refused(
+        self, client, db_session, monkeypatch, no_broker
+    ):
+        monkeypatch.setattr("app.core.config.settings.INTERNAL_API_KEY", self.INTERNAL_KEY)
+        monkeypatch.setattr("app.workers.tasks.llm_available", lambda: True)
+
+        response = await self._post(client, "no-such-user")
+
+        assert response.status_code == 412
+        assert no_broker == []

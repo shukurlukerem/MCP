@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -190,13 +191,22 @@ class RunAccepted(BaseModel):
 @router.post("/automation/run", response_model=RunAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def trigger_run(payload: RunRequest, db: AsyncSession = Depends(get_db)):
     """Queue an LLM ⇄ MCP run for a SABAH.OS user."""
-    from app.workers.tasks import execute_mcp_task
+    from app.workers.tasks import LLM_DISABLED_MESSAGE, execute_mcp_task, llm_available
 
     cred = await get_credential(db, sabah_user_id=payload.sabah_user_id)
     if not cred:
         raise HTTPException(
             status_code=status.HTTP_412_PRECONDITION_FAILED,
             detail="User has no connected Google account",
+        )
+
+    # Same gate the user-facing route applies. Without it a deployment with no
+    # LLM configured accepts every run with 202 and then fails it in the worker,
+    # so the Integrations page shows a spinner that resolves into nothing.
+    if not llm_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=LLM_DISABLED_MESSAGE,
         )
 
     query = select(MCPServer).where(MCPServer.enabled.is_(True))
@@ -222,7 +232,25 @@ async def trigger_run(payload: RunRequest, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(run)
 
-    execute_mcp_task.delay(run.id, cred.user_id)
+    # Publishing to Celery is blocking socket I/O. Awaiting it directly on the
+    # event loop stalls every other request in this process — the API runs a
+    # single uvicorn worker — for as long as an unreachable broker takes to give
+    # up, which is long enough for the proxy in front to answer 502 instead.
+    try:
+        await run_in_threadpool(execute_mcp_task.delay, run.id, cred.user_id)
+    except Exception as exc:
+        # The row is already committed; leaving it "pending" would make the UI
+        # poll a run nobody will ever pick up.
+        logger.exception("Could not queue automation run %s", run.id)
+        run.status = "error"
+        run.error_message = f"Could not queue the run: {exc}"
+        run.finished_at = datetime.now(timezone.utc)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The automation queue is unavailable — the run was not started.",
+        )
+
     return RunAccepted(run_id=run.id, status="pending")
 
 
