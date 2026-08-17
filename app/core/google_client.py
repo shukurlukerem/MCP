@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.google_policy import CAPABILITY_WORKSPACE, ensure_allowed
 from app.core.google_scopes import ALLOWED_GOOGLE_HOSTS, services_from_scopes
 from app.core.security import decrypt_token, encrypt_token
 from app.models.credential import GoogleCredential
@@ -175,16 +176,25 @@ async def google_request(
     params: Optional[dict] = None,
     json_body: Optional[dict] = None,
     timeout: float = 30.0,
+    capability: str = CAPABILITY_WORKSPACE,
 ) -> Any:
     """
     Perform an authorised call against any Google API.
 
-    The host allowlist is the safety boundary: this helper attaches a live
-    corporate OAuth token, so it must never be pointed at an arbitrary URL.
+    Two boundaries, both enforced here because this is the only path to Google:
+
+    * ``capability`` decides whether the Workspace surface is switched on at all.
+      It defaults to the restrictive value, so a new call site that does not think
+      about the verification pause fails closed instead of reaching Google.
+    * the host allowlist is the safety boundary on *where* the token may go: this
+      helper attaches a live corporate OAuth token, so it must never be pointed at
+      an arbitrary URL.
     """
+    ensure_allowed(capability)
+
     host = urlparse(url).netloc
     if host not in ALLOWED_GOOGLE_HOSTS:
-        raise GoogleAuthError(f"Host not allowed for Google passthrough: {host!r}")
+        raise GoogleAuthError(f"Host not allowed for Google API access: {host!r}")
 
     token = await access_token_for(credential, session)
     async with httpx.AsyncClient(timeout=timeout) as client:

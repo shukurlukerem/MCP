@@ -1,12 +1,26 @@
 """
-Google Workspace service catalogue.
+Google Workspace service catalogue — the single source of truth for OAuth scopes.
 
-This deployment is **corporate and internal** — every user is an employee of the
-company, signing in with a company Google account. The consent screen therefore
-asks for the full set of Workspace scopes at once, so a user connects a single
-time and the platform can read every service they own.
+**No scope string may be hardcoded anywhere else.** Django and the public landing
+page both used to keep their own copies, which drifted; the authorization request,
+the consent-screen disclosure and the Google Cloud Console list must agree exactly
+or verification fails on the mismatch alone.
 
-Each entry describes one service:
+What gets requested is chosen by ``GOOGLE_OAUTH_SCOPE_TIER``:
+
+* ``login_only`` (default) — identity only. Non-sensitive, so Google shows no
+  "unverified app" screen and the request does not consume the project's 100-user
+  cap. This is what keeps sign-in working while verification is pending.
+* ``full`` — identity plus every Workspace scope below. Sensitive scopes, so this
+  is only safe to enable once Google has approved the app.
+
+Every scope here is non-sensitive or sensitive. **No restricted scope is
+requested**, which is what removes the mandatory annual paid CASA security
+assessment. ``RESTRICTED_SCOPES`` records the three that were dropped so the
+re-consent job can spot grants that still carry them, and so the guard at the
+bottom of this module fails the process if one is ever reintroduced.
+
+Each service entry describes:
 
 * ``scopes``    — OAuth scopes requested for it
 * ``api_base``  — REST root used by the direct data-pull API (``app/api/google.py``)
@@ -17,12 +31,33 @@ Each entry describes one service:
 
 from typing import Dict, List
 
-# Identity — always requested.
-CORE_SCOPES: List[str] = [
+# Identity — always requested, in either tier. All three are non-sensitive.
+LOGIN_SCOPES: List[str] = [
     "openid",
     "email",
     "profile",
 ]
+
+SCOPE_TIER_LOGIN_ONLY = "login_only"
+SCOPE_TIER_FULL = "full"
+SCOPE_TIERS = (SCOPE_TIER_LOGIN_ONLY, SCOPE_TIER_FULL)
+
+# Restricted scopes, deliberately removed and never to return. Each one obliges an
+# annual paid third-party CASA assessment, and none had a demonstrable feature
+# behind it: the only consumers were a generic read surface exposed to the LLM's
+# discretion, which is not something Google's per-scope review can accept.
+#
+# `drive`          → replaced by `drive.file` (files the app created or the user
+#                    explicitly picked via Google Picker)
+# `gmail.readonly` → removed outright, no mailbox reading
+# `gmail.compose`  → replaced by `gmail.send` + `gmail.labels`
+RESTRICTED_SCOPES = frozenset(
+    {
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.compose",
+    }
+)
 
 
 class Service:
@@ -51,12 +86,13 @@ SERVICES: Dict[str, Service] = {
     "gmail": Service(
         key="gmail",
         label="Gmail",
+        # Send-only. `gmail.readonly` and `gmail.compose` are restricted and gone;
+        # `gmail.settings.basic` is dropped too because nothing reads or writes
+        # mail settings. Note that users.drafts.create is NOT available under
+        # gmail.send — approval happens in-app, then we send directly.
         scopes=[
-            "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/gmail.send",
-            "https://www.googleapis.com/auth/gmail.compose",
             "https://www.googleapis.com/auth/gmail.labels",
-            "https://www.googleapis.com/auth/gmail.settings.basic",
         ],
         api_base="https://gmail.googleapis.com/gmail/v1",
         mcp_url="https://gmail.googleapis.com/mcp",
@@ -64,10 +100,13 @@ SERVICES: Dict[str, Service] = {
     "drive": Service(
         key="drive",
         label="Google Drive",
-        # Full drive scope — the corporate use case is "read everything the
-        # employee can see", which drive.file (per-file consent) cannot do.
+        # `drive.file` (non-sensitive) covers files this app created plus files the
+        # user explicitly picked in Google Picker — the user chooses the blast
+        # radius, which also removes the prompt-injection path that full `drive`
+        # opened up. `drive.metadata.readonly` keeps listing/browsing working
+        # without granting content access.
         scopes=[
-            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/drive.file",
             "https://www.googleapis.com/auth/drive.metadata.readonly",
         ],
         api_base="https://www.googleapis.com/drive/v3",
@@ -187,7 +226,7 @@ ALLOWED_GOOGLE_HOSTS = frozenset(
 
 def scopes_for(service_keys: List[str]) -> List[str]:
     """Return the deduplicated scope list for the given services, plus identity."""
-    seen: List[str] = list(CORE_SCOPES)
+    seen: List[str] = list(LOGIN_SCOPES)
     for key in service_keys:
         service = SERVICES.get(key)
         if not service:
@@ -198,13 +237,74 @@ def scopes_for(service_keys: List[str]) -> List[str]:
     return seen
 
 
+# Every Workspace scope an ordinary employee can grant — the `full` tier, and the
+# exact list to paste into Google Cloud Console → Data Access.
+WORKSPACE_SCOPES: List[str] = scopes_for(DEFAULT_SERVICES)
+
+
+def scopes_for_tier(tier: str) -> List[str]:
+    """
+    Resolve a scope tier to the list to put in the authorization request.
+
+    An unrecognised tier falls back to identity-only rather than raising: failing
+    open here would mean silently asking for sensitive scopes on a typo, which is
+    precisely the mistake that put this app behind the unverified-app screen.
+    """
+    if tier == SCOPE_TIER_FULL:
+        return list(WORKSPACE_SCOPES)
+    return list(LOGIN_SCOPES)
+
+
+def granted_restricted_scopes(granted: List[str]) -> List[str]:
+    """
+    Restricted scopes a stored grant still carries.
+
+    Reducing what we *request* does not revoke what was *granted*. Google's
+    reviewers look at live grants, so the re-consent job uses this to find tokens
+    that must be re-authorized with the minimal set.
+    """
+    return sorted(RESTRICTED_SCOPES.intersection(granted or []))
+
+
+# Fail at import if a restricted scope ever creeps back into the catalogue. A test
+# would catch it too, but this also stops a running deployment from quietly asking
+# for CASA-triggering access.
+_leaked = RESTRICTED_SCOPES.intersection(WORKSPACE_SCOPES)
+if _leaked:
+    raise RuntimeError(
+        f"Restricted Google scopes must never be requested: {sorted(_leaked)}. "
+        "Each one obliges an annual paid CASA security assessment."
+    )
+
+
+# Scopes this app no longer requests but which older grants still carry. Used only
+# when reading a stored grant back — never when building a request. Without it, an
+# employee who consented before the scope reduction would reverse-map to *fewer*
+# services than they actually granted, and the platform would report their Drive or
+# Gmail access as absent while Google still considers it live.
+LEGACY_SERVICE_SCOPES: Dict[str, str] = {
+    "https://www.googleapis.com/auth/drive": "drive",
+    "https://www.googleapis.com/auth/gmail.readonly": "gmail",
+    "https://www.googleapis.com/auth/gmail.compose": "gmail",
+    "https://www.googleapis.com/auth/gmail.settings.basic": "gmail",
+}
+
+
 def services_from_scopes(granted: List[str]) -> List[str]:
-    """Reverse-map granted scopes to the service keys they unlock."""
+    """
+    Reverse-map granted scopes to the service keys they unlock.
+
+    Recognises legacy scopes as well as current ones, so this stays truthful about
+    what an existing grant can reach.
+    """
     granted_set = set(granted or [])
+    legacy = {
+        key for scope, key in LEGACY_SERVICE_SCOPES.items() if scope in granted_set
+    }
     return [
         key
         for key, service in SERVICES.items()
-        if any(scope in granted_set for scope in service.scopes)
+        if key in legacy or any(scope in granted_set for scope in service.scopes)
     ]
 
 

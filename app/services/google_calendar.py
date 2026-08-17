@@ -17,6 +17,7 @@ carry a Calendar scope.
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.google_client import google_request
+from app.core.google_policy import CAPABILITY_CALENDAR_CONFERENCE
 from app.core.google_scopes import SERVICES
 from app.models.credential import GoogleCredential
 
@@ -81,6 +82,7 @@ async def create_conference(
         _api(f"/calendars/{calendar_id}/events"),
         params={"conferenceDataVersion": 1, "sendUpdates": "none"},
         json_body=body,
+        capability=CAPABILITY_CALENDAR_CONFERENCE,
     )
 
     return {
@@ -106,6 +108,7 @@ async def update_event(
         _api(f"/calendars/{calendar_id}/events/{google_event_id}"),
         params={"sendUpdates": "none"},
         json_body=event,
+        capability=CAPABILITY_CALENDAR_CONFERENCE,
     )
 
 
@@ -123,4 +126,5 @@ async def delete_event(
         "DELETE",
         _api(f"/calendars/{calendar_id}/events/{google_event_id}"),
         params={"sendUpdates": "none"},
+        capability=CAPABILITY_CALENDAR_CONFERENCE,
     )

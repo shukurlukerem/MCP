@@ -1,10 +1,11 @@
 """
 Google OAuth — "Continue with Google" for corporate accounts.
 
-The consent screen asks for the full Workspace scope set in one pass, so a user
-connects once and every service (Gmail, Drive, Calendar, Docs, Sheets, …) becomes
-readable by the automation layer. Only accounts on the configured corporate
-domain(s) are accepted.
+What the consent screen asks for is decided by ``GOOGLE_OAUTH_SCOPE_TIER`` and
+defined in ``app.core.google_scopes`` — the single source of truth for scopes. The
+default tier is identity-only, which keeps sign-in working while the app's OAuth
+verification is pending. Only accounts on the configured corporate domain(s) are
+accepted.
 """
 
 import logging
@@ -13,9 +14,10 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlencode
 
-# Google routinely returns the granted scopes in a different order (and adds
-# `openid`/`https://www.googleapis.com/auth/userinfo.*` when `include_granted_scopes`
-# is on). By default oauthlib treats any such difference as an error and raises
+# Google routinely returns the granted scopes in a different order, and maps
+# `email`/`profile` onto their `https://www.googleapis.com/auth/userinfo.*` forms.
+# It also returns scopes the account already had. By default oauthlib treats any
+# such difference as an error and raises
 # `Warning("Scope has changed from ... to ...")` from inside fetch_token, which
 # surfaces here as a generic "token_exchange_failed". Relaxing the check lets the
 # exchange succeed; we still record whatever scopes Google actually granted.
@@ -36,7 +38,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.google_client import get_credential, revoke_credential
-from app.core.google_scopes import describe_services, scopes_for, services_from_scopes
+from app.core.google_policy import calendar_conference_enabled, workspace_enabled
+from app.core.google_scopes import (
+    LOGIN_SCOPES,
+    RESTRICTED_SCOPES,
+    WORKSPACE_SCOPES,
+    describe_services,
+    scopes_for_tier,
+    services_from_scopes,
+)
 from app.core.security import (
     create_oauth_state,
     get_current_user,
@@ -58,7 +68,15 @@ def _mask(value: Optional[str]) -> str:
 
 
 def google_scopes() -> list:
-    return scopes_for(settings.GOOGLE_SERVICES)
+    """
+    Scopes for the authorization request, chosen by ``GOOGLE_OAUTH_SCOPE_TIER``.
+
+    ``login_only`` (the default) asks for identity only. Those three scopes are
+    non-sensitive, so Google shows no "unverified app" screen and the request does
+    not draw on the project's exhausted 100-user cap — which is what lets a brand
+    new employee sign in while verification is still pending.
+    """
+    return scopes_for_tier(settings.GOOGLE_OAUTH_SCOPE_TIER)
 
 
 def _build_flow(state: Optional[str] = None) -> Flow:
@@ -109,9 +127,13 @@ def build_authorization_url(
     flow = _build_flow(state=state)
     kwargs = {
         "access_type": "offline",         # required for a refresh token
-        "include_granted_scopes": "true",
         "prompt": "consent",              # force refresh token on re-consent
         "state": state,
+        # `include_granted_scopes` is deliberately absent and must stay absent.
+        # With it on, Google re-attaches every scope the user previously granted to
+        # the new request, so a returning employee would still see the
+        # "Google hasn't verified this app" screen even though this request asks
+        # only for identity — making the scope reduction look like it had failed.
     }
     if settings.GOOGLE_HOSTED_DOMAIN:
         kwargs["hd"] = settings.GOOGLE_HOSTED_DOMAIN
@@ -340,9 +362,31 @@ async def google_disconnect(
 
 @router.get("/google/services")
 async def google_services():
-    """Services this deployment requests on the consent screen."""
+    """
+    What this deployment asks Google for, and what it can currently do.
+
+    Deliberately unauthenticated: it is the machine-readable counterpart to the
+    public "How SABAH.OS uses Google data" disclosure, so an OAuth reviewer can
+    check the page against the running configuration. It is also what the CI parity
+    job compares the landing page's scope list against.
+
+    ``requested_scopes`` is what the live authorization request carries right now;
+    ``workspace_scopes`` is the full target list for Google Cloud Console →
+    Data Access. Under the default identity-only tier these differ, which is
+    intended, not drift.
+    """
     return {
         "services": describe_services(settings.GOOGLE_SERVICES),
-        "scopes": google_scopes(),
+        "scope_tier": settings.GOOGLE_OAUTH_SCOPE_TIER,
+        "requested_scopes": google_scopes(),
+        "workspace_scopes": WORKSPACE_SCOPES,
+        "login_scopes": LOGIN_SCOPES,
+        # No restricted scope is requested — this is what keeps the app out of the
+        # mandatory annual paid CASA assessment.
+        "restricted_scopes_removed": sorted(RESTRICTED_SCOPES),
+        "workspace_integrations_enabled": workspace_enabled(),
+        "meet_conferences_enabled": calendar_conference_enabled(),
         "allowed_domains": settings.ALLOWED_EMAIL_DOMAINS,
+        # Retained under its old name so existing clients keep working.
+        "scopes": google_scopes(),
     }

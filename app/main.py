@@ -1,12 +1,14 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.db import async_session_factory, engine
+from app.core.google_policy import WorkspaceDisabledError
 from app.api.auth import router as auth_router
 from app.api.automation import router as automation_router
 from app.api.google import router as google_router
@@ -29,8 +31,12 @@ async def lifespan(app: FastAPI):
     async with async_session_factory() as session:
         await ensure_google_servers(session)
     logger.info(
-        "MCP Automation Service started (env=%s, google_services=%s)",
+        "MCP Automation Service started (env=%s, scope_tier=%s, workspace_enabled=%s, "
+        "meet_enabled=%s, google_services=%s)",
         settings.ENVIRONMENT,
+        settings.GOOGLE_OAUTH_SCOPE_TIER,
+        settings.GOOGLE_WORKSPACE_INTEGRATIONS_ENABLED,
+        settings.GOOGLE_CALENDAR_CONFERENCE_ENABLED,
         ",".join(settings.GOOGLE_SERVICES),
     )
     yield
@@ -53,6 +59,21 @@ app = FastAPI(
     redoc_url=None if settings.is_production else "/redoc",
     openapi_url=None if settings.is_production else "/openapi.json",
 )
+
+@app.exception_handler(WorkspaceDisabledError)
+async def workspace_disabled_handler(_request: Request, exc: WorkspaceDisabledError):
+    """
+    Answer a paused Workspace capability with 503 and the reason.
+
+    A guard that raised out of a route would reach the client as an unexplained
+    500, which is exactly the "stack trace, not a message" outcome the pause is
+    meant to avoid. 503 also tells callers the condition is temporary.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": str(exc)},
+    )
+
 
 app.add_middleware(
     CORSMiddleware,

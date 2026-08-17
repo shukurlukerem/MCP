@@ -27,6 +27,11 @@ from app.core.google_client import (
     revoke_credential,
     upsert_credential,
 )
+from app.core.google_policy import (
+    WORKSPACE_PAUSED_MESSAGE,
+    calendar_conference_enabled,
+    workspace_enabled,
+)
 from app.core.google_scopes import describe_services
 from app.core.security import require_internal_key
 from app.models.automation_run import AutomationRun
@@ -137,8 +142,17 @@ async def auth_url(
 
 @router.get("/google/services")
 async def services():
+    """
+    Service catalogue plus the current verification posture.
+
+    Django relays the flags to the SPA, which uses them to hide the "Connect
+    Google" entry point rather than offering a button that would only 503.
+    """
     return {
         "services": describe_services(settings.GOOGLE_SERVICES),
+        "scope_tier": settings.GOOGLE_OAUTH_SCOPE_TIER,
+        "workspace_integrations_enabled": workspace_enabled(),
+        "meet_conferences_enabled": calendar_conference_enabled(),
         "allowed_domains": settings.ALLOWED_EMAIL_DOMAINS,
     }
 
@@ -153,6 +167,14 @@ class ReadRequest(BaseModel):
 
 @router.post("/google/read")
 async def read(payload: ReadRequest, db: AsyncSession = Depends(get_db)) -> Any:
+    # Django surfaces 503 to the SPA with the detail intact, so the employee sees
+    # why rather than an unexplained gateway error.
+    if not workspace_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=WORKSPACE_PAUSED_MESSAGE,
+        )
+
     cred = await get_credential(db, sabah_user_id=payload.sabah_user_id)
     if not cred:
         raise HTTPException(
