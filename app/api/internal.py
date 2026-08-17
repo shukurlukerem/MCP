@@ -135,9 +135,23 @@ async def disconnect(sabah_user_id: str, db: AsyncSession = Depends(get_db)):
 async def auth_url(
     sabah_user_id: str = Query(...),
     redirect_to: Optional[str] = Query(default=None),
+    next: Optional[str] = Query(default=None, description="In-app path to land on"),
 ):
-    """Consent URL bound to a SABAH.OS user, for the connect-only (no login) flow."""
-    return build_authorization_url(sabah_user_id=sabah_user_id, redirect_to=redirect_to)
+    """
+    Consent URL bound to a SABAH.OS user, for the connect-only (no login) flow.
+
+    Refused while Workspace integrations are paused: under the identity-only scope
+    tier there is nothing to connect, so sending the user through consent would
+    grant no Workspace access and look like a broken feature.
+    """
+    if not workspace_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=WORKSPACE_PAUSED_MESSAGE,
+        )
+    return build_authorization_url(
+        sabah_user_id=sabah_user_id, redirect_to=redirect_to, next_path=next
+    )
 
 
 @router.get("/google/services")
