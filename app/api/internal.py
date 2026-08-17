@@ -31,7 +31,7 @@ from app.core.google_scopes import describe_services
 from app.core.security import require_internal_key
 from app.models.automation_run import AutomationRun
 from app.models.mcp_server import MCPServer
-from app.services import google_data
+from app.services import google_calendar, google_data
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,100 @@ async def read(payload: ReadRequest, db: AsyncSession = Depends(get_db)) -> Any:
         )
         raise HTTPException(status_code=code, detail=message)
     return {"resource": payload.resource, "data": data}
+
+
+# ── Google Meet conferences ──────────────────────────────────────────────────
+# SABAH.OS owns the calendar event; only Google can mint the Meet link. Django
+# builds the Google event resource (it has the model) and posts it here, because
+# this service is the only holder of the Google credential.
+
+
+class ConferenceCreate(BaseModel):
+    sabah_user_id: str
+    # A Google Calendar event resource, built by Django from its CalendarEvent.
+    event: dict
+    # Stable per event so a retry returns the same Meet link, not a second one.
+    request_id: str
+
+
+class EventMutate(BaseModel):
+    sabah_user_id: str
+    event: dict = {}
+
+
+async def _conference_credential(sabah_user_id: str, db: AsyncSession):
+    """Resolve a credential that can still act on the user's calendar."""
+    cred = await get_credential(db, sabah_user_id=sabah_user_id)
+    if not cred:
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail="Connect your Google account to add Google Meet video conferencing.",
+        )
+    if not google_calendar.granted_conference_access(cred):
+        # The grant predates or postdates Calendar access. Say so plainly rather
+        # than letting Google answer 403 and surfacing that as a gateway error.
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail=(
+                "This Google account has not granted Calendar access, so a Meet "
+                "link cannot be created. Reconnect it from Integrations."
+            ),
+        )
+    return cred
+
+
+def _conference_error(exc: GoogleAuthError):
+    message = str(exc)
+    code = (
+        status.HTTP_412_PRECONDITION_FAILED
+        if "reconnect required" in message
+        else status.HTTP_502_BAD_GATEWAY
+    )
+    raise HTTPException(status_code=code, detail=message)
+
+
+@router.post("/google/calendar/conference")
+async def create_conference(payload: ConferenceCreate, db: AsyncSession = Depends(get_db)):
+    """Create a mirrored event with a Meet conference and return the link."""
+    cred = await _conference_credential(payload.sabah_user_id, db)
+    try:
+        return await google_calendar.create_conference(
+            cred, db, event=payload.event, request_id=payload.request_id
+        )
+    except GoogleAuthError as exc:
+        _conference_error(exc)
+
+
+@router.patch("/google/calendar/event/{google_event_id}")
+async def update_conference_event(
+    google_event_id: str,
+    payload: EventMutate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Push an edit to a mirrored event."""
+    cred = await _conference_credential(payload.sabah_user_id, db)
+    try:
+        await google_calendar.update_event(
+            cred, db, google_event_id=google_event_id, event=payload.event
+        )
+    except GoogleAuthError as exc:
+        _conference_error(exc)
+    return {"status": "ok"}
+
+
+@router.delete("/google/calendar/event/{google_event_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conference_event(
+    google_event_id: str,
+    sabah_user_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a mirrored event."""
+    cred = await _conference_credential(sabah_user_id, db)
+    try:
+        await google_calendar.delete_event(cred, db, google_event_id=google_event_id)
+    except GoogleAuthError as exc:
+        _conference_error(exc)
+    return None
 
 
 # ── Automation runs ──────────────────────────────────────────────────────────
