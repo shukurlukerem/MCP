@@ -17,6 +17,7 @@ from sqlalchemy import select
 
 from app.core.db import async_session_factory
 from app.core.google_client import GoogleAuthError, get_credential
+from app.core.google_policy import WorkspaceDisabledError, workspace_enabled
 from app.core.security import get_current_user
 from app.models.automation_run import AutomationRun
 from app.models.mcp_server import MCPServer
@@ -36,7 +37,15 @@ current_user_id: ContextVar[Optional[str]] = ContextVar("current_user_id", defau
 
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    """
+    Tools this session may call.
+
+    The Google tools are omitted entirely while Workspace integrations are paused,
+    rather than advertised and then refused. A model shown a tool will keep
+    retrying it and narrate failures at the user; a model that never sees it simply
+    answers from what it does have.
+    """
+    tools = [
         Tool(
             name="get_automation_runs",
             description="List your automation runs, optionally filtered by status",
@@ -75,6 +84,12 @@ async def list_tools() -> list[Tool]:
                 "required": ["run_id"],
             },
         ),
+    ]
+
+    if not workspace_enabled():
+        return tools
+
+    tools += [
         Tool(
             name="google_workspace_snapshot",
             description=(
@@ -111,6 +126,7 @@ async def list_tools() -> list[Tool]:
             },
         ),
     ]
+    return tools
 
 
 @mcp_server.call_tool()
@@ -131,6 +147,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return await _google_snapshot(session, user_id, arguments)
             if name == "google_read":
                 return await _google_read(session, user_id, arguments)
+        except WorkspaceDisabledError as exc:
+            # Reachable when a model calls a tool name it remembers from an earlier
+            # session, after the pause took effect.
+            return [_json({"error": str(exc)})]
         except GoogleAuthError as exc:
             return [_json({"error": str(exc)})]
         except Exception as exc:  # never leak a traceback into the model's context

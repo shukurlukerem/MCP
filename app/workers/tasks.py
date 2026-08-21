@@ -8,6 +8,7 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.core.db import async_session_factory
 from app.core.google_client import GoogleAuthError, get_credential
+from app.core.google_policy import WorkspaceDisabledError, workspace_enabled
 from app.mcp.client import build_mcp_tools_config
 from app.models.automation_run import AutomationRun
 from app.models.mcp_server import MCPServer
@@ -87,9 +88,18 @@ async def _execute_async(run_id: int, user_id: str) -> dict:
                 "No connected Google account for this user — reconnect required"
             )
 
+        # Fail closed, and fail *loudly*: a run that reached the worker while
+        # Workspace integrations are paused must end as an error the user can read,
+        # not succeed with an answer the model invented without tool access.
+        if needs_oauth and not workspace_enabled():
+            raise PermanentTaskError(
+                "Google integrations are temporarily paused pending Google "
+                "verification, so this automation cannot read your Workspace."
+            )
+
         try:
             mcp_tools = await build_mcp_tools_config(credential, servers, session)
-        except GoogleAuthError as exc:
+        except (GoogleAuthError, WorkspaceDisabledError) as exc:
             raise PermanentTaskError(str(exc)) from exc
 
         if not mcp_tools:

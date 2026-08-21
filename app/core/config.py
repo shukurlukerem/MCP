@@ -5,7 +5,12 @@ from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from cryptography.fernet import Fernet
 
-from app.core.google_scopes import DEFAULT_SERVICES, SERVICES
+from app.core.google_scopes import (
+    DEFAULT_SERVICES,
+    SCOPE_TIER_LOGIN_ONLY,
+    SCOPE_TIERS,
+    SERVICES,
+)
 
 
 class Settings(BaseSettings):
@@ -60,8 +65,27 @@ class Settings(BaseSettings):
     ALLOWED_EMAIL_DOMAINS: List[str] = []
     # Passed to Google as `hd` so the account chooser is pre-filtered.
     GOOGLE_HOSTED_DOMAIN: str = ""
-    # Services requested on the consent screen.
+    # Services requested on the consent screen when the tier is "full".
     GOOGLE_SERVICES: List[str] = DEFAULT_SERVICES
+
+    # ── Google verification posture ───────────────────────────────────────────
+    # Which scope tier the authorization request asks for: "login_only" (identity
+    # only — non-sensitive, no unverified-app screen, no 100-user-cap usage) or
+    # "full" (identity + every Workspace scope). Defaults to login_only so a
+    # deployment that forgets to set it cannot accidentally ask for sensitive
+    # scopes while the app is unverified.
+    GOOGLE_OAUTH_SCOPE_TIER: str = SCOPE_TIER_LOGIN_ONLY
+
+    # Master switch for every Workspace API call. Off means fail closed with a
+    # user-facing message, not a stack trace and not a silent no-op.
+    GOOGLE_WORKSPACE_INTEGRATIONS_ENABLED: bool = False
+
+    # Narrow exemption from the switch above: minting a Google Meet link for a
+    # calendar event the user just created. It is user-initiated, writes only to
+    # the organiser's own calendar, and `calendar` is sensitive rather than
+    # restricted, so keeping it available for grants that already carry Calendar
+    # access costs nothing in verification terms and keeps a shipped feature alive.
+    GOOGLE_CALENDAR_CONFERENCE_ENABLED: bool = True
 
     # ── SABAH.OS integration ──────────────────────────────────────────────────
     # Where to send the browser after the OAuth dance completes.
@@ -103,6 +127,16 @@ class Settings(BaseSettings):
     @classmethod
     def normalise_domains(cls, v: List[str]) -> List[str]:
         return [d.strip().lower().lstrip("@") for d in v if d and d.strip()]
+
+    @field_validator("GOOGLE_OAUTH_SCOPE_TIER", mode="after")
+    @classmethod
+    def validate_scope_tier(cls, v: str) -> str:
+        tier = (v or "").strip().lower()
+        if tier not in SCOPE_TIERS:
+            raise ValueError(
+                f"GOOGLE_OAUTH_SCOPE_TIER must be one of {list(SCOPE_TIERS)}, got {v!r}"
+            )
+        return tier
 
     @field_validator("GOOGLE_SERVICES", mode="after")
     @classmethod

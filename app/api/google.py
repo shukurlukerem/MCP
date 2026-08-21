@@ -9,19 +9,39 @@ show a user's mail, files, calendar and the rest without paying for a model call
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.google_client import GoogleAuthError, get_credential, google_request
+from app.core.google_client import GoogleAuthError, get_credential
+from app.core.google_policy import WORKSPACE_PAUSED_MESSAGE, workspace_enabled
 from app.core.security import get_current_user
 from app.models.credential import GoogleCredential
 from app.services import google_data
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/google", tags=["google"])
+
+def require_workspace_enabled() -> None:
+    """
+    Refuse the whole Workspace read surface while integrations are paused.
+
+    `google_request` already fails closed, but stopping at the router keeps the
+    refusal readable and avoids a pointless credential lookup on every call.
+    """
+    if not workspace_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=WORKSPACE_PAUSED_MESSAGE,
+        )
+
+
+router = APIRouter(
+    prefix="/google",
+    tags=["google"],
+    dependencies=[Depends(require_workspace_enabled)],
+)
 
 
 async def current_credential(
@@ -182,36 +202,14 @@ async def tasks(
         _handle(exc)
 
 
-# ── Escape hatch ─────────────────────────────────────────────────────────────
-
-class PassthroughRequest(BaseModel):
-    method: str = "GET"
-    url: str
-    params: dict = {}
-    json_body: Optional[dict] = None
-
-
-@router.post("/passthrough")
-async def passthrough(
-    request: PassthroughRequest = Body(...),
-    cred: GoogleCredential = Depends(current_credential),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Authorised call to any Google API host on the allowlist.
-
-    Google ships new endpoints faster than this service can wrap them; this keeps
-    the platform from being blocked on a missing wrapper. The host allowlist in
-    `app.core.google_scopes` is what stops the corporate token leaving Google.
-    """
-    try:
-        return await google_request(
-            cred,
-            db,
-            request.method,
-            request.url,
-            params=request.params or None,
-            json_body=request.json_body,
-        )
-    except GoogleAuthError as exc:
-        _handle(exc)
+# The arbitrary-URL passthrough that used to live here has been removed. It took a
+# caller-supplied URL and attached a live corporate OAuth token, allowlisted only
+# by host — so any endpoint on googleapis.com was reachable, including everything
+# the (now removed) restricted `drive` and `gmail.readonly` grants covered. Handed
+# to an LLM, that turned a prompt-injection payload in one ingested document into
+# read access across a user's whole Workspace.
+#
+# It is also unjustifiable in OAuth verification: Google requires a specific,
+# demonstrable feature per scope, and "the model may decide to call something"
+# cannot be shown in a demo video. Access now goes exclusively through the named
+# readers in `google_data.RESOURCES`, which are enumerable and reviewable.
