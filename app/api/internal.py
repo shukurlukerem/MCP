@@ -302,6 +302,54 @@ async def delete_conference_event(
     return None
 
 
+# ── Calendar synchronisation ─────────────────────────────────────────────────
+# SABAH.OS mirrors the signed-in employee's own Google Calendar into its calendar
+# page once an hour. It is a read of the user's own data under the same Calendar
+# scope the Meet button already uses, but it runs unattended, so it sits behind
+# its own capability switch.
+
+
+class EventsPull(BaseModel):
+    sabah_user_id: str
+    # ISO-8601 window bounds. Django decides how far back and forward to look.
+    time_min: str
+    time_max: str
+    calendar_id: str = "primary"
+    page_token: Optional[str] = None
+    max_results: int = google_calendar.EVENTS_PAGE_SIZE
+
+
+@router.post("/google/calendar/events")
+async def list_calendar_events(payload: EventsPull, db: AsyncSession = Depends(get_db)):
+    """One page of the user's own calendar events, for the SABAH.OS importer."""
+    cred = await get_credential(db, sabah_user_id=payload.sabah_user_id)
+    if not cred:
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail="Connect your Google account to synchronise your calendar.",
+        )
+    if not google_calendar.granted_calendar_read(cred):
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail=(
+                "This Google account has not granted Calendar access, so your "
+                "calendar cannot be synchronised. Reconnect it from Integrations."
+            ),
+        )
+    try:
+        return await google_calendar.list_events(
+            cred,
+            db,
+            time_min=payload.time_min,
+            time_max=payload.time_max,
+            calendar_id=payload.calendar_id,
+            page_token=payload.page_token,
+            max_results=payload.max_results,
+        )
+    except GoogleAuthError as exc:
+        _conference_error(exc)
+
+
 # ── Automation runs ──────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):

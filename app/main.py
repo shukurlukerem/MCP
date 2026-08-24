@@ -32,11 +32,12 @@ async def lifespan(app: FastAPI):
         await ensure_google_servers(session)
     logger.info(
         "MCP Automation Service started (env=%s, scope_tier=%s, workspace_enabled=%s, "
-        "meet_enabled=%s, google_services=%s)",
+        "meet_enabled=%s, calendar_sync_enabled=%s, google_services=%s)",
         settings.ENVIRONMENT,
         settings.GOOGLE_OAUTH_SCOPE_TIER,
         settings.GOOGLE_WORKSPACE_INTEGRATIONS_ENABLED,
         settings.GOOGLE_CALENDAR_CONFERENCE_ENABLED,
+        settings.GOOGLE_CALENDAR_SYNC_ENABLED,
         ",".join(settings.GOOGLE_SERVICES),
     )
     yield

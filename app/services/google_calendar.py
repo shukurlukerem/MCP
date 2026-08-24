@@ -16,13 +16,28 @@ carry a Calendar scope.
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from typing import Optional
+
 from app.core.google_client import google_request
-from app.core.google_policy import CAPABILITY_CALENDAR_CONFERENCE
+from app.core.google_policy import (
+    CAPABILITY_CALENDAR_CONFERENCE,
+    CAPABILITY_CALENDAR_SYNC,
+)
 from app.core.google_scopes import SERVICES
 from app.models.credential import GoogleCredential
 
 # Either Calendar scope is enough to create an event with a conference request.
 CALENDAR_SCOPES = frozenset(SERVICES["calendar"].scopes)
+# Reading the user's own calendar also works under the read-only scope, which a
+# grant may carry even though it can never mint a conference.
+CALENDAR_READ_SCOPES = CALENDAR_SCOPES | {
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events.readonly",
+}
+
+# One page of a calendar window. Google caps this at 2500; 250 keeps a single
+# response small enough that a slow link does not time out mid-sync.
+EVENTS_PAGE_SIZE = 250
 
 
 def granted_conference_access(cred: GoogleCredential) -> bool:
@@ -35,6 +50,11 @@ def granted_conference_access(cred: GoogleCredential) -> bool:
     gets a clear refusal instead of a 403 from Google.
     """
     return bool(CALENDAR_SCOPES.intersection(cred.scopes or []))
+
+
+def granted_calendar_read(cred: GoogleCredential) -> bool:
+    """True when this grant can read the user's calendar."""
+    return bool(CALENDAR_READ_SCOPES.intersection(cred.scopes or []))
 
 
 def _api(path: str) -> str:
@@ -128,3 +148,45 @@ async def delete_event(
         params={"sendUpdates": "none"},
         capability=CAPABILITY_CALENDAR_CONFERENCE,
     )
+
+
+async def list_events(
+    cred: GoogleCredential,
+    session: AsyncSession,
+    *,
+    time_min: str,
+    time_max: str,
+    calendar_id: str = "primary",
+    page_token: Optional[str] = None,
+    max_results: int = EVENTS_PAGE_SIZE,
+) -> dict:
+    """
+    One page of the user's own events in [time_min, time_max).
+
+    ``singleEvents`` expands recurrences into concrete occurrences, which is what
+    SABAH.OS stores (it materialises series too), and ``showDeleted`` keeps
+    cancellations in the page so the importer can retract an event that vanished
+    from Google rather than leaving a ghost on the grid.
+    """
+    data = await google_request(
+        cred,
+        session,
+        "GET",
+        _api(f"/calendars/{calendar_id}/events"),
+        params={
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "maxResults": min(max(max_results, 1), 2500),
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "showDeleted": "true",
+            "pageToken": page_token or None,
+        },
+        capability=CAPABILITY_CALENDAR_SYNC,
+    )
+    return {
+        "items": data.get("items", []) or [],
+        "next_page_token": data.get("nextPageToken", "") or "",
+        "calendar_timezone": data.get("timeZone", "") or "",
+        "calendar_id": calendar_id,
+    }
