@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     # access costs nothing in verification terms and keeps a shipped feature alive.
     GOOGLE_CALENDAR_CONFERENCE_ENABLED: bool = True
 
+    # Reading the signed-in user's own calendar so SABAH.OS can mirror it into
+    # its calendar page. Same reasoning as the exemption above — own calendar,
+    # sensitive rather than restricted scope — but a separate switch, because an
+    # operator may want to stop the hourly background pull without also breaking
+    # the Meet button an employee is pressing right now.
+    GOOGLE_CALENDAR_SYNC_ENABLED: bool = True
+
     # ── SABAH.OS integration ──────────────────────────────────────────────────
     # Where to send the browser after the OAuth dance completes.
     FRONTEND_REDIRECT_URL: str = "http://localhost:3000/auth/google/callback"

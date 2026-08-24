@@ -22,6 +22,7 @@ from app.core.config import settings
 # Capability names understood by `ensure_allowed`.
 CAPABILITY_WORKSPACE = "workspace"
 CAPABILITY_CALENDAR_CONFERENCE = "calendar_conference"
+CAPABILITY_CALENDAR_SYNC = "calendar_sync"
 
 WORKSPACE_PAUSED_MESSAGE = (
     "Google integrations are temporarily paused pending Google verification"
@@ -30,6 +31,10 @@ WORKSPACE_PAUSED_MESSAGE = (
 CALENDAR_CONFERENCE_PAUSED_MESSAGE = (
     "Google Meet link creation is temporarily unavailable pending Google "
     "verification. The event was still saved in SABAH.OS."
+)
+
+CALENDAR_SYNC_PAUSED_MESSAGE = (
+    "Google Calendar synchronisation is temporarily switched off on this server."
 )
 
 
@@ -58,9 +63,16 @@ def calendar_conference_enabled() -> bool:
     return bool(settings.GOOGLE_CALENDAR_CONFERENCE_ENABLED)
 
 
+def calendar_sync_enabled() -> bool:
+    """True when the hourly pull of a user's own calendar is available."""
+    return bool(settings.GOOGLE_CALENDAR_SYNC_ENABLED)
+
+
 def capability_enabled(capability: str) -> bool:
     if capability == CAPABILITY_CALENDAR_CONFERENCE:
         return calendar_conference_enabled()
+    if capability == CAPABILITY_CALENDAR_SYNC:
+        return calendar_sync_enabled()
     # Unknown capabilities are treated as part of the broad surface, so a typo
     # cannot accidentally grant an exemption.
     return workspace_enabled()
@@ -70,9 +82,8 @@ def ensure_allowed(capability: str = CAPABILITY_WORKSPACE) -> None:
     """Raise ``WorkspaceDisabledError`` unless *capability* is currently permitted."""
     if capability_enabled(capability):
         return
-    message = (
-        CALENDAR_CONFERENCE_PAUSED_MESSAGE
-        if capability == CAPABILITY_CALENDAR_CONFERENCE
-        else WORKSPACE_PAUSED_MESSAGE
-    )
+    message = {
+        CAPABILITY_CALENDAR_CONFERENCE: CALENDAR_CONFERENCE_PAUSED_MESSAGE,
+        CAPABILITY_CALENDAR_SYNC: CALENDAR_SYNC_PAUSED_MESSAGE,
+    }.get(capability, WORKSPACE_PAUSED_MESSAGE)
     raise WorkspaceDisabledError(message)
