@@ -32,7 +32,7 @@ from app.core.google_policy import (
     calendar_conference_enabled,
     workspace_enabled,
 )
-from app.core.google_scopes import describe_services
+from app.core.google_scopes import SCOPE_TIER_LOGIN_ONLY, describe_services
 from app.core.security import require_internal_key
 from app.models.automation_run import AutomationRun
 from app.models.mcp_server import MCPServer
@@ -140,11 +140,14 @@ async def auth_url(
     """
     Consent URL bound to a SABAH.OS user, for the connect-only (no login) flow.
 
-    Refused while Workspace integrations are paused: under the identity-only scope
-    tier there is nothing to connect, so sending the user through consent would
-    grant no Workspace access and look like a broken feature.
+    Refused only when there would genuinely be nothing to connect: under the
+    identity-only tier, consent grants no Workspace access at all, so sending the
+    user through it would look like a broken feature. A narrower tier such as
+    ``calendar`` does grant something, so the connect flow stays open even while
+    the broad Workspace surface is paused — otherwise enabling the calendar would
+    also mean enabling Gmail and Drive just to reach the consent screen.
     """
-    if not workspace_enabled():
+    if not workspace_enabled() and settings.GOOGLE_OAUTH_SCOPE_TIER == SCOPE_TIER_LOGIN_ONLY:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=WORKSPACE_PAUSED_MESSAGE,

@@ -39,8 +39,9 @@ LOGIN_SCOPES: List[str] = [
 ]
 
 SCOPE_TIER_LOGIN_ONLY = "login_only"
+SCOPE_TIER_CALENDAR = "calendar"
 SCOPE_TIER_FULL = "full"
-SCOPE_TIERS = (SCOPE_TIER_LOGIN_ONLY, SCOPE_TIER_FULL)
+SCOPE_TIERS = (SCOPE_TIER_LOGIN_ONLY, SCOPE_TIER_CALENDAR, SCOPE_TIER_FULL)
 
 # Restricted scopes, deliberately removed and never to return. Each one obliges an
 # annual paid third-party CASA assessment, and none had a demonstrable feature
@@ -242,6 +243,17 @@ def scopes_for(service_keys: List[str]) -> List[str]:
 WORKSPACE_SCOPES: List[str] = scopes_for(DEFAULT_SERVICES)
 
 
+# Identity plus Calendar, and nothing else — the tier that turns the calendar page
+# on without asking for Gmail, Drive or anything else the feature does not read.
+# Both Calendar scopes are requested rather than only `calendar.readonly`, because
+# minting a Google Meet link is a write and is already a shipped feature; a
+# read-only grant would quietly break the Meet button for everyone who consents
+# after the change. Calendar scopes are sensitive, so this tier still shows the
+# unverified-app screen until Google approves the app — but it is one scope family
+# instead of all of them, and no restricted scope, so still no CASA assessment.
+CALENDAR_TIER_SCOPES: List[str] = scopes_for(["calendar"])
+
+
 def scopes_for_tier(tier: str) -> List[str]:
     """
     Resolve a scope tier to the list to put in the authorization request.
@@ -252,6 +264,8 @@ def scopes_for_tier(tier: str) -> List[str]:
     """
     if tier == SCOPE_TIER_FULL:
         return list(WORKSPACE_SCOPES)
+    if tier == SCOPE_TIER_CALENDAR:
+        return list(CALENDAR_TIER_SCOPES)
     return list(LOGIN_SCOPES)
 
 

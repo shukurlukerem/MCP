@@ -20,8 +20,10 @@ from app.core.google_policy import (
     ensure_allowed,
 )
 from app.core.google_scopes import (
+    CALENDAR_TIER_SCOPES,
     LOGIN_SCOPES,
     RESTRICTED_SCOPES,
+    SERVICES,
     WORKSPACE_SCOPES,
     granted_restricted_scopes,
     scopes_for_tier,
@@ -54,6 +56,40 @@ class TestScopeTiers:
 
     def test_full_requests_exactly_the_workspace_set(self, monkeypatch):
         assert _authorization_scopes(monkeypatch, "full") == WORKSPACE_SCOPES
+
+    def test_calendar_tier_asks_for_identity_and_calendar_only(self, monkeypatch):
+        """
+        The tier that turns the calendar page on. Anything beyond Calendar here
+        would mean an employee consenting to Gmail and Drive to see their agenda.
+        """
+        scopes = _authorization_scopes(monkeypatch, "calendar")
+
+        assert scopes == CALENDAR_TIER_SCOPES
+        assert scopes[:3] == ["openid", "email", "profile"]
+        assert set(SERVICES["calendar"].scopes).issubset(scopes)
+        assert not any("gmail" in scope or "drive" in scope for scope in scopes)
+
+    def test_calendar_tier_can_both_read_and_mint_a_meet_link(self, monkeypatch):
+        """
+        Read-only would have been narrower, but the Meet button is a write and is
+        already shipped — a read-only grant would break it for everyone who
+        consents after the switch.
+        """
+        from app.services.google_calendar import (
+            CALENDAR_READ_SCOPES,
+            CALENDAR_SCOPES,
+        )
+
+        scopes = set(_authorization_scopes(monkeypatch, "calendar"))
+
+        assert scopes & CALENDAR_SCOPES
+        assert scopes & CALENDAR_READ_SCOPES
+
+    def test_calendar_tier_carries_no_restricted_scope(self, monkeypatch):
+        """No restricted scope means no annual paid CASA assessment."""
+        scopes = _authorization_scopes(monkeypatch, "calendar")
+
+        assert granted_restricted_scopes(scopes) == []
 
     def test_login_only_is_the_default(self):
         # A deployment that never sets the variable must not ask for sensitive
