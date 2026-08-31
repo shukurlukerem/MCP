@@ -319,10 +319,9 @@ class EventsPull(BaseModel):
     max_results: int = google_calendar.EVENTS_PAGE_SIZE
 
 
-@router.post("/google/calendar/events")
-async def list_calendar_events(payload: EventsPull, db: AsyncSession = Depends(get_db)):
-    """One page of the user's own calendar events, for the SABAH.OS importer."""
-    cred = await get_credential(db, sabah_user_id=payload.sabah_user_id)
+async def _calendar_read_credential(sabah_user_id: str, db: AsyncSession):
+    """Resolve a credential that may read the user's own calendar."""
+    cred = await get_credential(db, sabah_user_id=sabah_user_id)
     if not cred:
         raise HTTPException(
             status_code=status.HTTP_412_PRECONDITION_FAILED,
@@ -336,6 +335,13 @@ async def list_calendar_events(payload: EventsPull, db: AsyncSession = Depends(g
                 "calendar cannot be synchronised. Reconnect it from Integrations."
             ),
         )
+    return cred
+
+
+@router.post("/google/calendar/events")
+async def list_calendar_events(payload: EventsPull, db: AsyncSession = Depends(get_db)):
+    """One page of the user's own calendar events, for the SABAH.OS importer."""
+    cred = await _calendar_read_credential(payload.sabah_user_id, db)
     try:
         return await google_calendar.list_events(
             cred,
@@ -345,6 +351,52 @@ async def list_calendar_events(payload: EventsPull, db: AsyncSession = Depends(g
             calendar_id=payload.calendar_id,
             page_token=payload.page_token,
             max_results=payload.max_results,
+        )
+    except GoogleAuthError as exc:
+        _conference_error(exc)
+
+
+class EventsSyncPull(BaseModel):
+    sabah_user_id: str
+    calendar_id: str = "primary"
+    # Present → incremental. Absent → a full sync anchored at ``time_min``, whose
+    # last page hands back the token the next run should send.
+    sync_token: str = ""
+    time_min: Optional[str] = None
+    page_token: Optional[str] = None
+    max_results: int = google_calendar.EVENTS_PAGE_SIZE
+
+
+@router.post("/google/calendar/events/sync")
+async def sync_calendar_events(payload: EventsSyncPull, db: AsyncSession = Depends(get_db)):
+    """
+    One page of a full or incremental sync of the user's own calendar.
+
+    An aged-out syncToken comes back as **409 Conflict**, not an error: it is the
+    documented, expected way Google ends a token's life, and Django answers it by
+    dropping the token and repeating the call as a full sync. Giving it a status
+    of its own is what keeps that ordinary event out of the member's sync chip.
+    """
+    cred = await _calendar_read_credential(payload.sabah_user_id, db)
+    if not payload.sync_token and not payload.time_min:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A full sync needs time_min; an incremental one needs sync_token.",
+        )
+    try:
+        return await google_calendar.list_events_sync(
+            cred,
+            db,
+            calendar_id=payload.calendar_id,
+            sync_token=payload.sync_token,
+            time_min=payload.time_min,
+            page_token=payload.page_token,
+            max_results=payload.max_results,
+        )
+    except google_calendar.SyncTokenExpired as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"sync_token_expired: {exc}",
         )
     except GoogleAuthError as exc:
         _conference_error(exc)

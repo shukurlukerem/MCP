@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from typing import Optional
 
-from app.core.google_client import google_request
+from app.core.google_client import GoogleAuthError, google_request
 from app.core.google_policy import (
     CAPABILITY_CALENDAR_CONFERENCE,
     CAPABILITY_CALENDAR_SYNC,
@@ -189,4 +189,94 @@ async def list_events(
         "next_page_token": data.get("nextPageToken", "") or "",
         "calendar_timezone": data.get("timeZone", "") or "",
         "calendar_id": calendar_id,
+    }
+
+
+# ── Incremental synchronisation ──────────────────────────────────────────────
+# `list_events` above answers "what is in this window right now" and is what the
+# calendar page reads. The pair below answers "what changed since last time",
+# which is a different Google request: a syncToken cannot be combined with
+# `timeMin`, `timeMax` or `orderBy` (Google answers 400), and a response only
+# carries `nextSyncToken` on its final page.
+
+
+class SyncTokenExpired(Exception):
+    """
+    Google refused the stored syncToken — the caller must redo a full sync.
+
+    Routine rather than exceptional: Google expires sync tokens on its own
+    schedule and after certain calendar-wide changes, and the documented
+    response is to discard the token and start over. Kept separate from
+    ``GoogleAuthError`` precisely so a caller does not treat it as a failure.
+    """
+
+
+# Google signals an aged-out token with 410 Gone. Some calendars answer 400 with
+# `"Sync token is no longer valid"` in the body instead, which means the same
+# thing and must not be reported to the member as a hard error.
+def _sync_token_rejected(exc: GoogleAuthError) -> bool:
+    code = getattr(exc, "status_code", None)
+    if code == 410:
+        return True
+    return code == 400 and "sync token" in str(exc).lower()
+
+
+async def list_events_sync(
+    cred: GoogleCredential,
+    session: AsyncSession,
+    *,
+    calendar_id: str = "primary",
+    sync_token: str = "",
+    time_min: Optional[str] = None,
+    page_token: Optional[str] = None,
+    max_results: int = EVENTS_PAGE_SIZE,
+) -> dict:
+    """
+    One page of either a full sync (``time_min``) or an incremental one
+    (``sync_token``).
+
+    ``singleEvents`` and ``showDeleted`` are sent on both, because Google
+    requires an incremental request to repeat the settings its token was minted
+    under. ``orderBy`` is sent on neither: it suppresses ``nextSyncToken``
+    entirely, which would silently keep every run a full sync.
+
+    Raises ``SyncTokenExpired`` when the token has aged out, so the caller can
+    drop it and start again.
+    """
+    if sync_token:
+        params: dict = {"syncToken": sync_token}
+    else:
+        params = {"timeMin": time_min}
+
+    params.update(
+        {
+            "singleEvents": "true",
+            "showDeleted": "true",
+            "maxResults": min(max(max_results, 1), 2500),
+            "pageToken": page_token or None,
+        }
+    )
+
+    try:
+        data = await google_request(
+            cred,
+            session,
+            "GET",
+            _api(f"/calendars/{calendar_id}/events"),
+            params=params,
+            capability=CAPABILITY_CALENDAR_SYNC,
+        )
+    except GoogleAuthError as exc:
+        if sync_token and _sync_token_rejected(exc):
+            raise SyncTokenExpired(str(exc)) from exc
+        raise
+
+    return {
+        "items": data.get("items", []) or [],
+        "next_page_token": data.get("nextPageToken", "") or "",
+        # Present only on the last page; an empty value mid-walk is expected.
+        "next_sync_token": data.get("nextSyncToken", "") or "",
+        "calendar_timezone": data.get("timeZone", "") or "",
+        "calendar_id": calendar_id,
+        "incremental": bool(sync_token),
     }

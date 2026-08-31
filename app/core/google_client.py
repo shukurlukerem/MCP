@@ -28,7 +28,19 @@ REFRESH_MARGIN = timedelta(minutes=5)
 
 
 class GoogleAuthError(Exception):
-    """Raised when a credential cannot be used or refreshed."""
+    """
+    Raised when a credential cannot be used or refreshed.
+
+    ``status_code`` carries Google's own HTTP status when the failure came from
+    an API response, so a caller can tell the cases apart without parsing the
+    message. The incremental calendar sync needs exactly that: a 410 means the
+    stored syncToken has aged out and the caller must redo a full sync, which is
+    routine, while every other status is a real failure.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 async def get_credential(
@@ -209,7 +221,8 @@ async def google_request(
     if response.status_code >= 400:
         raise GoogleAuthError(
             f"Google API {method.upper()} {url} failed "
-            f"({response.status_code}): {response.text[:500]}"
+            f"({response.status_code}): {response.text[:500]}",
+            status_code=response.status_code,
         )
 
     if not response.content:
