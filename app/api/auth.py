@@ -127,7 +127,12 @@ def build_authorization_url(
     flow = _build_flow(state=state)
     kwargs = {
         "access_type": "offline",         # required for a refresh token
-        "prompt": "consent",              # force refresh token on re-consent
+        # `select_account` always shows the account chooser, so a user with a live
+        # Google session picks their mailbox instead of being dropped on the
+        # email/password form; `consent` stays so re-consent still yields a
+        # refresh token. Order matters only for readability — Google treats the
+        # value as an unordered space-separated set.
+        "prompt": "select_account consent",
         "state": state,
         # `include_granted_scopes` is deliberately absent and must stay absent.
         # With it on, Google re-attaches every scope the user previously granted to

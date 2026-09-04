@@ -197,7 +197,9 @@ class TestIncrementalAuthIsOff:
         assert "include_granted_scopes" not in params
         # These two must survive: without them there is no refresh token.
         assert params["access_type"] == ["offline"]
-        assert params["prompt"] == ["consent"]
+        # `select_account` gives the returning user the account chooser rather
+        # than the bare email/password form; `consent` keeps the refresh token.
+        assert set(params["prompt"][0].split()) == {"select_account", "consent"}
 
 
 # ── Fail-closed behaviour ────────────────────────────────────────────────────

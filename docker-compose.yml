@@ -16,7 +16,9 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      # Loopback only. Published on 0.0.0.0 this was a Postgres reachable from
+      # the whole internet with the default user/password from the line above.
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-mcpdb}"]
       interval: 10s
@@ -30,7 +32,13 @@ services:
     volumes:
       - redisdata:/data
     ports:
-      - "6379:6379"
+      # Loopback only, and this one matters most: Redis takes no password here,
+      # so publishing it on 0.0.0.0 handed anyone who found the port a full
+      # read/write connection. That is how a Redis ends up `REPLICAOF` an
+      # attacker's master — it goes read-only, Celery dies with
+      # `ReadOnlyError: You can't write against a read only replica`, and the
+      # attacker's crafted RDB is the usual next step towards code execution.
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -46,7 +54,9 @@ services:
     environment:
       RUN_MIGRATIONS: "true"
     ports:
-      - "8001:8000"
+      # Loopback only — a reverse proxy is the public entrance, as in
+      # docker-compose.prod.yml.
+      - "127.0.0.1:8001:8000"
     env_file: .env
     depends_on:
       postgres:
