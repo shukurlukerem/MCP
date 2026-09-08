@@ -116,8 +116,15 @@ SERVICES: Dict[str, Service] = {
     "calendar": Service(
         key="calendar",
         label="Google Calendar",
+        # Events only. Full `calendar` additionally grants creating, sharing and
+        # permanently deleting whole calendars plus their ACLs, and nothing here
+        # does any of that: every call this app makes is under
+        # `/calendars/{id}/events`. The one exception was an uncalled
+        # `calendarList` helper, which is not worth the wider grant. Dropping it
+        # shrinks the consent text from "permanently delete all the calendars you
+        # can access" to editing events, which is both truthful and a smaller
+        # surface for review.
         scopes=[
-            "https://www.googleapis.com/auth/calendar",
             "https://www.googleapis.com/auth/calendar.events",
         ],
         api_base="https://www.googleapis.com/calendar/v3",
@@ -245,9 +252,9 @@ WORKSPACE_SCOPES: List[str] = scopes_for(DEFAULT_SERVICES)
 
 # Identity plus Calendar, and nothing else — the tier that turns the calendar page
 # on without asking for Gmail, Drive or anything else the feature does not read.
-# Both Calendar scopes are requested rather than only `calendar.readonly`, because
-# minting a Google Meet link is a write and is already a shipped feature; a
-# read-only grant would quietly break the Meet button for everyone who consents
+# `calendar.events` is requested rather than `calendar.readonly`, because minting a
+# Google Meet link is a write and is already a shipped feature; a read-only grant
+# would quietly break the Meet button for everyone who consents
 # after the change. Calendar scopes are sensitive, so this tier still shows the
 # unverified-app screen until Google approves the app — but it is one scope family
 # instead of all of them, and no restricted scope, so still no CASA assessment.
@@ -298,6 +305,9 @@ if _leaked:
 # Gmail access as absent while Google still considers it live.
 LEGACY_SERVICE_SCOPES: Dict[str, str] = {
     "https://www.googleapis.com/auth/drive": "drive",
+    # Dropped in favour of `calendar.events`; grants made before that still carry
+    # it, and they can still do everything the calendar feature needs.
+    "https://www.googleapis.com/auth/calendar": "calendar",
     "https://www.googleapis.com/auth/gmail.readonly": "gmail",
     "https://www.googleapis.com/auth/gmail.compose": "gmail",
     "https://www.googleapis.com/auth/gmail.settings.basic": "gmail",

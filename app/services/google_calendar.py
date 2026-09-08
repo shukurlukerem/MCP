@@ -26,8 +26,13 @@ from app.core.google_policy import (
 from app.core.google_scopes import SERVICES
 from app.models.credential import GoogleCredential
 
-# Either Calendar scope is enough to create an event with a conference request.
-CALENDAR_SCOPES = frozenset(SERVICES["calendar"].scopes)
+# Any Calendar write scope is enough to create an event with a conference request.
+# The legacy full `calendar` scope is included deliberately: it is no longer
+# requested, but every grant made before the reduction still carries it and must
+# keep its Meet button.
+CALENDAR_SCOPES = frozenset(SERVICES["calendar"].scopes) | {
+    "https://www.googleapis.com/auth/calendar",
+}
 # Reading the user's own calendar also works under the read-only scope, which a
 # grant may carry even though it can never mint a conference.
 CALENDAR_READ_SCOPES = CALENDAR_SCOPES | {
