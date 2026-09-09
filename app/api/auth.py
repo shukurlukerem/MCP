@@ -8,8 +8,10 @@ verification is pending. Only accounts on the configured corporate domain(s) are
 accepted.
 """
 
+import hashlib
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlencode
@@ -241,6 +243,47 @@ async def _complete_via_sabah(claims: dict, tokens: dict, *, next_path: str, lin
         return {"status": "error", "code": "sabah_bad_response", "next": next_path}
 
 
+# ── Replayed callbacks ───────────────────────────────────────────────────────
+# A Google authorization code is single-use: the second exchange of the same code
+# always fails with `invalid_grant / Bad Request`, whoever sends it. And the
+# callback URL does get fetched more than once in practice — a browser retry, a
+# corporate link scanner, a reverse-proxy retry, or the user reloading the tab.
+# Without this cache the duplicate turns a completed sign-in into an error page,
+# because the browser follows whichever response arrived last.
+#
+# So the outcome of a callback is remembered against a fingerprint of its code and
+# replayed verbatim. In-process is enough: the api container runs `--workers 1`
+# and nginx pins a client to one node with ip_hash. A miss (restart, second node)
+# simply degrades to today's behaviour — an error redirect, never a wrong session.
+_CALLBACK_REPLAY_TTL_SECONDS = 180
+_callback_results: dict = {}
+
+
+def _code_fingerprint(code: str) -> str:
+    """Short, non-reversible id for an authorization code — safe to log."""
+    return hashlib.sha256(code.encode()).hexdigest()[:12]
+
+
+def _remember_callback(fingerprint: str, params: dict) -> None:
+    now = time.monotonic()
+    # Prune here rather than on a timer: the map only grows on real sign-ins.
+    for key, (stored_at, _) in list(_callback_results.items()):
+        if now - stored_at > _CALLBACK_REPLAY_TTL_SECONDS:
+            _callback_results.pop(key, None)
+    _callback_results[fingerprint] = (now, params)
+
+
+def _recall_callback(fingerprint: str) -> Optional[dict]:
+    entry = _callback_results.get(fingerprint)
+    if not entry:
+        return None
+    stored_at, params = entry
+    if time.monotonic() - stored_at > _CALLBACK_REPLAY_TTL_SECONDS:
+        _callback_results.pop(fingerprint, None)
+        return None
+    return params
+
+
 @router.get("/google/callback")
 async def google_callback(
     code: Optional[str] = Query(default=None),
@@ -261,6 +304,18 @@ async def google_callback(
             redirect_to, {"status": "error", "code": error or "missing_code", "next": next_path}
         )
 
+    fingerprint = _code_fingerprint(code)
+    replayed = _recall_callback(fingerprint)
+    if replayed is not None:
+        # Same code, second delivery. Google would answer `invalid_grant` and the
+        # user would land on an error page after a sign-in that actually worked.
+        logger.info(
+            "Google callback replayed for an already-exchanged code (code=%s) "
+            "— returning the first result",
+            fingerprint,
+        )
+        return _callback_redirect(redirect_to, replayed)
+
     try:
         flow = _build_flow(state=state)
         flow.fetch_token(code=code)
@@ -268,11 +323,17 @@ async def google_callback(
         # oauthlib parsed Google's error body — this is the precise reason
         # (invalid_grant, redirect_uri_mismatch, invalid_client, …). None of
         # error/description contains a secret or the authorization code.
+        # The code fingerprint is what distinguishes the two causes of
+        # `invalid_grant`: the same fingerprint appearing twice in the log is a
+        # replayed code (harmless — the first exchange took it), while a first-time
+        # fingerprint failing means a real mismatch of redirect_uri, client or
+        # clock.
         logger.warning(
             "Google token exchange failed: error=%s description=%s "
-            "(redirect_uri=%s, client_id=%s)",
+            "(code=%s, redirect_uri=%s, client_id=%s)",
             getattr(exc, "error", "unknown"),
             getattr(exc, "description", str(exc)),
+            fingerprint,
             settings.GOOGLE_REDIRECT_URI,
             _mask(settings.GOOGLE_CLIENT_ID),
         )
@@ -285,9 +346,10 @@ async def google_callback(
         # type + message so the real cause is visible; never log code/secrets.
         logger.warning(
             "Google token exchange failed (unexpected %s): %s "
-            "(redirect_uri=%s, client_id=%s)",
+            "(code=%s, redirect_uri=%s, client_id=%s)",
             type(exc).__name__,
             exc,
+            fingerprint,
             settings.GOOGLE_REDIRECT_URI,
             _mask(settings.GOOGLE_CLIENT_ID),
         )
@@ -333,6 +395,9 @@ async def google_callback(
     params = await _complete_via_sabah(
         claims, tokens, next_path=next_path, link_user_id=state_data.get("sabah_user_id")
     )
+    # Only a spent code is worth remembering — the exchange above has already
+    # consumed it, so any further delivery of it can never succeed on its own.
+    _remember_callback(fingerprint, params)
     return _callback_redirect(redirect_to, params)
 
 

@@ -18,6 +18,21 @@ TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 TEST_FERNET_KEY = Fernet.generate_key().decode()
 
 
+@pytest.fixture(autouse=True)
+def _clear_oauth_callback_replay_cache():
+    """
+    The OAuth callback remembers the outcome of each authorization code so a
+    duplicate delivery replays it instead of failing on `invalid_grant`. That
+    memory is process-wide, so without this every test reusing a fixed fake code
+    would be served the previous test's result.
+    """
+    from app.api.auth import _callback_results
+
+    _callback_results.clear()
+    yield
+    _callback_results.clear()
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     loop = asyncio.get_event_loop_policy().new_event_loop()

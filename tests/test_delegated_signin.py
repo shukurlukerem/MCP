@@ -154,6 +154,37 @@ async def test_callback_forwards_django_redirect_params(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_duplicated_callback_replays_the_first_result(client, monkeypatch):
+    """
+    Seen in production: the callback URL was delivered twice with the same code,
+    seconds apart. A Google authorization code is single-use, so the second
+    exchange returns `invalid_grant` and the browser — which follows whichever
+    response lands last — showed an error page for a sign-in that had worked.
+    """
+    monkeypatch.setattr(auth_module.settings, "GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setattr(auth_module.settings, "GOOGLE_CLIENT_SECRET", "sec")
+    monkeypatch.setattr(auth_module, "_build_flow", lambda state=None: _FakeFlow())
+    monkeypatch.setattr(
+        auth_module.id_token,
+        "verify_oauth2_token",
+        lambda *a, **k: {"sub": "s", "email": "e@x.com", "email_verified": True, "name": "E"},
+    )
+    delegate = AsyncMock(return_value={"status": "success", "code": "login-code-1", "next": "/"})
+    monkeypatch.setattr(auth_module, "_complete_via_sabah", delegate)
+
+    state = create_oauth_state(
+        {"redirect_to": "https://sabahos.com/auth/google/callback", "next": "/", "sabah_user_id": None}
+    )
+    first = await client.get(f"/auth/google/callback?code=dup-code&state={state}")
+    second = await client.get(f"/auth/google/callback?code=dup-code&state={state}")
+
+    assert first.headers["location"] == second.headers["location"]
+    assert "status=success" in second.headers["location"]
+    # The second delivery must not reach Google or Django again.
+    assert delegate.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_callback_forwards_error_from_django(client, monkeypatch):
     monkeypatch.setattr(auth_module.settings, "GOOGLE_CLIENT_ID", "cid")
     monkeypatch.setattr(auth_module.settings, "GOOGLE_CLIENT_SECRET", "sec")
