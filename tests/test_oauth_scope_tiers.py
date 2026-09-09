@@ -54,36 +54,47 @@ class TestScopeTiers:
             "profile",
         ]
 
-    def test_full_requests_exactly_the_workspace_set(self, monkeypatch):
-        assert _authorization_scopes(monkeypatch, "full") == WORKSPACE_SCOPES
-
-    def test_calendar_tier_asks_for_identity_and_calendar_only(self, monkeypatch):
+    def test_every_tier_is_locked_to_identity_only(self, monkeypatch):
         """
-        The tier that turns the calendar page on. Anything beyond Calendar here
-        would mean an employee consenting to Gmail and Drive to see their agenda.
+        ``google_scopes()`` is pinned to identity while verification is pending, so
+        even an environment left on ``calendar`` or ``full`` cannot put Workspace
+        scopes back on the consent screen. Lift the lock in ``app/api/auth.py`` and
+        the three tier tests commented out below come back with it.
         """
-        scopes = _authorization_scopes(monkeypatch, "calendar")
+        for tier in ("login_only", "calendar", "full"):
+            assert _authorization_scopes(monkeypatch, tier) == LOGIN_SCOPES
 
-        assert scopes == CALENDAR_TIER_SCOPES
-        assert scopes[:3] == ["openid", "email", "profile"]
-        assert set(SERVICES["calendar"].scopes).issubset(scopes)
-        assert not any("gmail" in scope or "drive" in scope for scope in scopes)
-
-    def test_calendar_tier_can_both_read_and_mint_a_meet_link(self, monkeypatch):
-        """
-        Read-only would have been narrower, but the Meet button is a write and is
-        already shipped — a read-only grant would break it for everyone who
-        consents after the switch.
-        """
-        from app.services.google_calendar import (
-            CALENDAR_READ_SCOPES,
-            CALENDAR_SCOPES,
-        )
-
-        scopes = set(_authorization_scopes(monkeypatch, "calendar"))
-
-        assert scopes & CALENDAR_SCOPES
-        assert scopes & CALENDAR_READ_SCOPES
+    # ── Re-enable together with the scope-tier lock in app/api/auth.py ────────
+    # def test_full_requests_exactly_the_workspace_set(self, monkeypatch):
+    #     assert _authorization_scopes(monkeypatch, "full") == WORKSPACE_SCOPES
+    #
+    # def test_calendar_tier_asks_for_identity_and_calendar_only(self, monkeypatch):
+    #     """
+    #     The tier that turns the calendar page on. Anything beyond Calendar here
+    #     would mean an employee consenting to Gmail and Drive to see their agenda.
+    #     """
+    #     scopes = _authorization_scopes(monkeypatch, "calendar")
+    #
+    #     assert scopes == CALENDAR_TIER_SCOPES
+    #     assert scopes[:3] == ["openid", "email", "profile"]
+    #     assert set(SERVICES["calendar"].scopes).issubset(scopes)
+    #     assert not any("gmail" in scope or "drive" in scope for scope in scopes)
+    #
+    # def test_calendar_tier_can_both_read_and_mint_a_meet_link(self, monkeypatch):
+    #     """
+    #     Read-only would have been narrower, but the Meet button is a write and is
+    #     already shipped — a read-only grant would break it for everyone who
+    #     consents after the switch.
+    #     """
+    #     from app.services.google_calendar import (
+    #         CALENDAR_READ_SCOPES,
+    #         CALENDAR_SCOPES,
+    #     )
+    #
+    #     scopes = set(_authorization_scopes(monkeypatch, "calendar"))
+    #
+    #     assert scopes & CALENDAR_SCOPES
+    #     assert scopes & CALENDAR_READ_SCOPES
 
     def test_calendar_tier_carries_no_restricted_scope(self, monkeypatch):
         """No restricted scope means no annual paid CASA assessment."""

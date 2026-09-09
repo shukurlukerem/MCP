@@ -75,8 +75,17 @@ def google_scopes() -> list:
     non-sensitive, so Google shows no "unverified app" screen and the request does
     not draw on the project's exhausted 100-user cap — which is what lets a brand
     new employee sign in while verification is still pending.
+
+    LOCKED TO IDENTITY-ONLY while Google OAuth verification is pending. The tier
+    lookup is commented out rather than removed so a deployment whose environment
+    still carries ``GOOGLE_OAUTH_SCOPE_TIER=calendar`` (or ``full``) cannot put
+    Workspace scopes back on the consent screen and re-trigger the
+    "Google hasn't verified this app" warning. To restore Workspace consent after
+    approval: delete the ``return list(LOGIN_SCOPES)`` line, uncomment the
+    ``scopes_for_tier`` line under it, and set the tier in the environment.
     """
-    return scopes_for_tier(settings.GOOGLE_OAUTH_SCOPE_TIER)
+    return list(LOGIN_SCOPES)
+    # return scopes_for_tier(settings.GOOGLE_OAUTH_SCOPE_TIER)
 
 
 def _build_flow(state: Optional[str] = None) -> Flow:
